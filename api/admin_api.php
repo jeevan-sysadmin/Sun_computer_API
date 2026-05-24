@@ -23,6 +23,9 @@ require_once __DIR__ . '/helpers/jwt_helper.php';
 
 class AdminAPI {
     private $conn;
+    private $productStockColumn = null;
+    private $hasMinStockLevel = null;
+    private $hasSpareProductFlag = null;
     private $user;
 
     public function __construct() {
@@ -60,6 +63,121 @@ class AdminAPI {
             $this->sendError("Admin access required", 403);
             exit();
         }
+    }
+
+    private function normalizeIdList($value): array {
+        if ($value === null) {
+            return [];
+        }
+
+        $list = [];
+
+        if (is_array($value)) {
+            $list = $value;
+        } elseif (is_string($value)) {
+            $trimmed = trim($value);
+            if ($trimmed === '') {
+                return [];
+            }
+            $decoded = json_decode($trimmed, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $list = $decoded;
+            } else {
+                $list = explode(',', $trimmed);
+            }
+        } else {
+            $list = [$value];
+        }
+
+        $ids = [];
+        foreach ($list as $entry) {
+            $id = (int)$entry;
+            if ($id > 0) {
+                $ids[] = $id;
+            }
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    private function normalizeProductPayload(array $row): array {
+        if (isset($row['product']) && is_array($row['product'])) {
+            $row = array_merge($row['product'], $row);
+        }
+        if (isset($row['data']) && is_array($row['data'])) {
+            $row = array_merge($row['data'], $row);
+        }
+
+        if ((!isset($row['product_name']) || trim((string)$row['product_name']) === '')) {
+            $aliasKeys = ['productName', 'name', 'product_title'];
+            foreach ($aliasKeys as $aliasKey) {
+                if (isset($row[$aliasKey]) && trim((string)$row[$aliasKey]) !== '') {
+                    $row['product_name'] = trim((string)$row[$aliasKey]);
+                    break;
+                }
+            }
+        }
+
+        return $row;
+    }
+
+    private function syncOrderProducts(int $orderId, array $productIds, bool $isReplacement): void {
+        $deleteStmt = $this->conn->prepare("DELETE FROM service_order_products WHERE order_id = :order_id AND is_replacement = :is_replacement");
+        $deleteStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
+        $deleteStmt->bindValue(':is_replacement', $isReplacement ? 1 : 0, PDO::PARAM_INT);
+        $deleteStmt->execute();
+
+        if (empty($productIds)) {
+            return;
+        }
+
+        $insertStmt = $this->conn->prepare("INSERT INTO service_order_products (order_id, product_id, is_replacement, sort_order, created_at)
+                                            VALUES (:order_id, :product_id, :is_replacement, :sort_order, NOW())");
+
+        foreach ($productIds as $index => $productId) {
+            $insertStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
+            $insertStmt->bindValue(':product_id', (int)$productId, PDO::PARAM_INT);
+            $insertStmt->bindValue(':is_replacement', $isReplacement ? 1 : 0, PDO::PARAM_INT);
+            $insertStmt->bindValue(':sort_order', (int)$index, PDO::PARAM_INT);
+            $insertStmt->execute();
+        }
+    }
+
+    private function fetchOrderProductsMap(array $orderIds): array {
+        if (empty($orderIds)) {
+            return [];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($orderIds), '?'));
+        $query = "SELECT sop.order_id,
+                         sop.is_replacement,
+                         GROUP_CONCAT(sop.product_id ORDER BY sop.sort_order SEPARATOR ',') AS product_ids,
+                         GROUP_CONCAT(p.product_name ORDER BY sop.sort_order SEPARATOR '||') AS product_names
+                  FROM service_order_products sop
+                  JOIN products p ON sop.product_id = p.id
+                  WHERE sop.order_id IN ($placeholders)
+                  GROUP BY sop.order_id, sop.is_replacement";
+
+        $stmt = $this->conn->prepare($query);
+        $stmt->execute($orderIds);
+
+        $map = [];
+        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            $orderId = (int)$row['order_id'];
+            $bucket = ((int)$row['is_replacement'] === 1) ? 'replacement' : 'primary';
+            $ids = $row['product_ids'] !== null && $row['product_ids'] !== ''
+                ? array_map('intval', explode(',', $row['product_ids']))
+                : [];
+            $names = $row['product_names'] !== null && $row['product_names'] !== ''
+                ? explode('||', $row['product_names'])
+                : [];
+            $map[$orderId][$bucket] = [
+                'ids' => $ids,
+                'names' => $names
+            ];
+        }
+
+        return $map;
     }
     
     private function getBearerToken() {
@@ -502,10 +620,11 @@ class AdminAPI {
             $exclude_delivered = isset($_GET['exclude_delivered']) ? $_GET['exclude_delivered'] : false;
             
             $query = "SELECT o.*, c.full_name as client_name, c.phone as client_phone, c.email as client_email,
-                     c.address as client_address, p.product_name, p.brand, p.model, u.name as staff_name
+                     c.address as client_address, p.product_name, p.brand, p.model, rp.product_name as replacement_product_name, u.name as staff_name
                      FROM service_orders o 
                      LEFT JOIN clients c ON o.client_id = c.id 
                      LEFT JOIN products p ON o.product_id = p.id 
+                     LEFT JOIN products rp ON o.replacement_product_id = rp.id
                      LEFT JOIN users u ON o.staff_id = u.id
                      WHERE 1=1";
             
@@ -514,7 +633,7 @@ class AdminAPI {
             
             if (!empty($search)) {
                 $query .= " AND (o.order_code LIKE :search OR c.full_name LIKE :search 
-                           OR p.product_name LIKE :search OR u.name LIKE :search)";
+                           OR p.product_name LIKE :search OR rp.product_name LIKE :search OR u.name LIKE :search)";
                 $params[':search'] = "%$search%";
                 $types[':search'] = PDO::PARAM_STR;
             }
@@ -553,6 +672,36 @@ class AdminAPI {
             
             $stmt->execute();
             $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (!empty($orders)) {
+                $orderIds = array_map('intval', array_column($orders, 'id'));
+                $productMap = $this->fetchOrderProductsMap($orderIds);
+
+                foreach ($orders as &$order) {
+                    $orderId = (int)$order['id'];
+                    $primary = $productMap[$orderId]['primary'] ?? null;
+                    $replacement = $productMap[$orderId]['replacement'] ?? null;
+
+                    if ($primary) {
+                        $order['product_ids'] = $primary['ids'];
+                        $order['product_names'] = $primary['names'];
+                    } else {
+                        $primaryId = isset($order['product_id']) ? (int)$order['product_id'] : 0;
+                        $order['product_ids'] = $primaryId > 0 ? [$primaryId] : [];
+                        $order['product_names'] = !empty($order['product_name']) ? [$order['product_name']] : [];
+                    }
+
+                    if ($replacement) {
+                        $order['replacement_product_ids'] = $replacement['ids'];
+                        $order['replacement_product_names'] = $replacement['names'];
+                    } else {
+                        $replacementId = isset($order['replacement_product_id']) ? (int)$order['replacement_product_id'] : 0;
+                        $order['replacement_product_ids'] = $replacementId > 0 ? [$replacementId] : [];
+                        $order['replacement_product_names'] = !empty($order['replacement_product_name']) ? [$order['replacement_product_name']] : [];
+                    }
+                }
+                unset($order);
+            }
             
             $this->sendSuccess(['orders' => $orders]);
             
@@ -603,60 +752,77 @@ class AdminAPI {
                     }
                 }
 
-                if (!$client_id && $clientStmt->rowCount() > 0) {
-                    $client = $clientStmt->fetch(PDO::FETCH_ASSOC);
-                    $client_id = $client['id'];
-                    
-                    // Update client name if different
-                    $updateClientQuery = "UPDATE clients SET full_name = :full_name, updated_at = NOW() WHERE id = :id";
-                    $updateClientStmt = $this->conn->prepare($updateClientQuery);
-                    $updateClientStmt->bindValue(':full_name', $data['client_name'], PDO::PARAM_STR);
-                    $updateClientStmt->bindValue(':id', $client_id, PDO::PARAM_INT);
-                    $updateClientStmt->execute();
-                } else {
-                    // Create new client
-                    $client_code = 'CLT' . date('Ymd') . strtoupper(substr(uniqid(), -6));
-                    $clientInsert = "INSERT INTO clients (client_code, full_name, phone, email, address, created_at) 
-                                   VALUES (:client_code, :full_name, :phone, :email, :address, NOW())";
-                    $clientInsertStmt = $this->conn->prepare($clientInsert);
-                    $clientInsertStmt->bindValue(':client_code', $client_code, PDO::PARAM_STR);
-                    $clientInsertStmt->bindValue(':full_name', $data['client_name'], PDO::PARAM_STR);
-                    $clientInsertStmt->bindValue(':phone', $data['client_phone'], PDO::PARAM_STR);
-                    $clientInsertStmt->bindValue(':email', isset($data['client_email']) ? $data['client_email'] : '', PDO::PARAM_STR);
-                    $clientInsertStmt->bindValue(':address', isset($data['client_address']) ? $data['client_address'] : '', PDO::PARAM_STR);
-                    
-                    if ($clientInsertStmt->execute()) {
-                        $client_id = $this->conn->lastInsertId();
+                if (!$client_id) {
+                    if ($clientStmt->rowCount() > 0) {
+                        $client = $clientStmt->fetch(PDO::FETCH_ASSOC);
+                        $client_id = $client['id'];
+                        
+                        // Update client name if different
+                        $updateClientQuery = "UPDATE clients SET full_name = :full_name, updated_at = NOW() WHERE id = :id";
+                        $updateClientStmt = $this->conn->prepare($updateClientQuery);
+                        $updateClientStmt->bindValue(':full_name', $data['client_name'], PDO::PARAM_STR);
+                        $updateClientStmt->bindValue(':id', $client_id, PDO::PARAM_INT);
+                        $updateClientStmt->execute();
                     } else {
-                        throw new Exception("Failed to create client");
+                        // Create new client only when no valid client_id and no existing phone match.
+                        $client_code = 'CLT' . date('Ymd') . strtoupper(substr(uniqid(), -6));
+                        $clientInsert = "INSERT INTO clients (client_code, full_name, phone, email, address, created_at) 
+                                       VALUES (:client_code, :full_name, :phone, :email, :address, NOW())";
+                        $clientInsertStmt = $this->conn->prepare($clientInsert);
+                        $clientInsertStmt->bindValue(':client_code', $client_code, PDO::PARAM_STR);
+                        $clientInsertStmt->bindValue(':full_name', $data['client_name'], PDO::PARAM_STR);
+                        $clientInsertStmt->bindValue(':phone', $data['client_phone'], PDO::PARAM_STR);
+                        $clientInsertStmt->bindValue(':email', isset($data['client_email']) ? $data['client_email'] : '', PDO::PARAM_STR);
+                        $clientInsertStmt->bindValue(':address', isset($data['client_address']) ? $data['client_address'] : '', PDO::PARAM_STR);
+                        
+                        if ($clientInsertStmt->execute()) {
+                            $client_id = $this->conn->lastInsertId();
+                        } else {
+                            throw new Exception("Failed to create client");
+                        }
                     }
                 }
                 
-                // Check if product exists or create placeholder
-                $product_name = isset($data['product_name']) ? $data['product_name'] : 'Unknown Product';
-                $productQuery = "SELECT id FROM products WHERE product_name LIKE :product_name LIMIT 1";
-                $productStmt = $this->conn->prepare($productQuery);
-                $productStmt->bindValue(':product_name', "%$product_name%", PDO::PARAM_STR);
-                $productStmt->execute();
-                
+                $product_ids = $this->normalizeIdList($data['product_ids'] ?? ($data['product_id'] ?? null));
+                $replacement_product_ids = $this->normalizeIdList($data['replacement_product_ids'] ?? ($data['replacement_product_id'] ?? null));
+                $product_name = isset($data['product_name']) ? trim((string)$data['product_name']) : '';
+
+                if (empty($product_ids) && $product_name === '') {
+                    $this->sendError("Product is required", 400);
+                    return;
+                }
+
                 $product_id = null;
-                if ($productStmt->rowCount() > 0) {
-                    $product = $productStmt->fetch(PDO::FETCH_ASSOC);
-                    $product_id = $product['id'];
+                if (!empty($product_ids)) {
+                    $product_id = (int)$product_ids[0];
                 } else {
-                    // Create placeholder product
-                    $product_code = 'PRD' . date('Ymd') . strtoupper(substr(uniqid(), -6));
-                    $productInsert = "INSERT INTO products (product_code, product_name, category, price, status, created_at) 
-                                    VALUES (:product_code, :product_name, 'other', 0, 'active', NOW())";
-                    $productInsertStmt = $this->conn->prepare($productInsert);
-                    $productInsertStmt->bindValue(':product_code', $product_code, PDO::PARAM_STR);
-                    $productInsertStmt->bindValue(':product_name', $product_name, PDO::PARAM_STR);
+                    // Check if product exists or create placeholder
+                    $productQuery = "SELECT id FROM products WHERE product_name LIKE :product_name LIMIT 1";
+                    $productStmt = $this->conn->prepare($productQuery);
+                    $productStmt->bindValue(':product_name', "%$product_name%", PDO::PARAM_STR);
+                    $productStmt->execute();
                     
-                    if ($productInsertStmt->execute()) {
-                        $product_id = $this->conn->lastInsertId();
+                    if ($productStmt->rowCount() > 0) {
+                        $product = $productStmt->fetch(PDO::FETCH_ASSOC);
+                        $product_id = $product['id'];
                     } else {
-                        // Use default product ID 0
-                        $product_id = 0;
+                        // Create placeholder product
+                        $product_code = 'PRD' . date('Ymd') . strtoupper(substr(uniqid(), -6));
+                        $productInsert = "INSERT INTO products (product_code, product_name, category, price, status, created_at) 
+                                        VALUES (:product_code, :product_name, 'other', 0, 'active', NOW())";
+                        $productInsertStmt = $this->conn->prepare($productInsert);
+                        $productInsertStmt->bindValue(':product_code', $product_code, PDO::PARAM_STR);
+                        $productInsertStmt->bindValue(':product_name', $product_name, PDO::PARAM_STR);
+                        
+                        if ($productInsertStmt->execute()) {
+                            $product_id = $this->conn->lastInsertId();
+                        } else {
+                            $product_id = 0;
+                        }
+                    }
+
+                    if ($product_id) {
+                        $product_ids = [$product_id];
                     }
                 }
                 
@@ -673,10 +839,10 @@ class AdminAPI {
                     : 'general';
                 
                 // Create order
-                $orderQuery = "INSERT INTO service_orders (order_code, client_id, product_id, staff_id, service_type,
+                $orderQuery = "INSERT INTO service_orders (order_code, client_id, product_id, replacement_product_id, staff_id, service_type,
                              issue_description, warranty_status, estimated_cost, final_cost, deposit_amount, 
                              payment_status, estimated_delivery_date, status, priority, notes, created_at)
-                             VALUES (:order_code, :client_id, :product_id, :staff_id, :service_type,
+                             VALUES (:order_code, :client_id, :product_id, :replacement_product_id, :staff_id, :service_type,
                              :issue_description, :warranty_status, :estimated_cost, :final_cost, :deposit_amount,
                              :payment_status, :estimated_delivery_date, :status, :priority, :notes, NOW())";
                 
@@ -684,6 +850,7 @@ class AdminAPI {
                 $orderStmt->bindValue(':order_code', $order_code, PDO::PARAM_STR);
                 $orderStmt->bindValue(':client_id', $client_id, PDO::PARAM_INT);
                 $orderStmt->bindValue(':product_id', $product_id, PDO::PARAM_INT);
+                $orderStmt->bindValue(':replacement_product_id', !empty($replacement_product_ids) ? (int)$replacement_product_ids[0] : null, !empty($replacement_product_ids) ? PDO::PARAM_INT : PDO::PARAM_NULL);
                 $orderStmt->bindValue(':staff_id', isset($data['staff_id']) && !empty($data['staff_id']) ? $data['staff_id'] : null, PDO::PARAM_INT);
                 $orderStmt->bindValue(':service_type', $service_type, PDO::PARAM_STR);
                 $orderStmt->bindValue(':issue_description', $data['issue_description'], PDO::PARAM_STR);
@@ -699,6 +866,9 @@ class AdminAPI {
                 
                 if ($orderStmt->execute()) {
                     $order_id = $this->conn->lastInsertId();
+
+                    $this->syncOrderProducts((int)$order_id, $product_ids, false);
+                    $this->syncOrderProducts((int)$order_id, $replacement_product_ids, true);
                     
                     // Create payment record if there's an amount
                     if ($final_cost > 0) {
@@ -790,7 +960,7 @@ class AdminAPI {
             
             try {
                 // Check if order exists
-                $checkQuery = "SELECT id, order_code, payment_status, final_cost, deposit_amount FROM service_orders WHERE id = :id";
+                $checkQuery = "SELECT id, order_code, payment_status, final_cost, deposit_amount, product_id, replacement_product_id FROM service_orders WHERE id = :id";
                 $checkStmt = $this->conn->prepare($checkQuery);
                 $checkStmt->bindValue(':id', $data['id'], PDO::PARAM_INT);
                 $checkStmt->execute();
@@ -821,6 +991,26 @@ class AdminAPI {
                     $productStmt->bindValue(':order_id', $data['id'], PDO::PARAM_INT);
                     $productStmt->execute();
                 }
+
+                $productIdsProvided = array_key_exists('product_ids', $data) || array_key_exists('product_id', $data);
+                $replacementIdsProvided = array_key_exists('replacement_product_ids', $data) || array_key_exists('replacement_product_id', $data);
+                $new_product_ids = null;
+                $new_replacement_product_ids = null;
+                $new_product_id = (int)($existingOrder['product_id'] ?? 0);
+                $new_replacement_product_id = $existingOrder['replacement_product_id'] ?? null;
+
+                if ($productIdsProvided) {
+                    $new_product_ids = $this->normalizeIdList($data['product_ids'] ?? ($data['product_id'] ?? null));
+                    if (empty($new_product_ids)) {
+                        throw new Exception("At least one product is required");
+                    }
+                    $new_product_id = (int)$new_product_ids[0];
+                }
+
+                if ($replacementIdsProvided) {
+                    $new_replacement_product_ids = $this->normalizeIdList($data['replacement_product_ids'] ?? ($data['replacement_product_id'] ?? null));
+                    $new_replacement_product_id = !empty($new_replacement_product_ids) ? (int)$new_replacement_product_ids[0] : null;
+                }
                 
                 // Get new values
                 $new_final_cost = isset($data['final_cost']) ? floatval($data['final_cost']) : floatval($existingOrder['final_cost']);
@@ -832,6 +1022,8 @@ class AdminAPI {
                 
                 // Update order
                 $query = "UPDATE service_orders SET 
+                         product_id = :product_id,
+                         replacement_product_id = :replacement_product_id,
                          service_type = :service_type,
                          issue_description = :issue_description,
                          warranty_status = :warranty_status,
@@ -849,6 +1041,8 @@ class AdminAPI {
                 
                 $stmt = $this->conn->prepare($query);
                 $stmt->bindValue(':id', $data['id'], PDO::PARAM_INT);
+                $stmt->bindValue(':product_id', $new_product_id, PDO::PARAM_INT);
+                $stmt->bindValue(':replacement_product_id', $new_replacement_product_id, $new_replacement_product_id ? PDO::PARAM_INT : PDO::PARAM_NULL);
                 $stmt->bindValue(':service_type', $new_service_type, PDO::PARAM_STR);
                 $stmt->bindValue(':issue_description', $data['issue_description'], PDO::PARAM_STR);
                 $stmt->bindValue(':warranty_status', $data['warranty_status'], PDO::PARAM_STR);
@@ -863,6 +1057,14 @@ class AdminAPI {
                 $stmt->bindValue(':notes', isset($data['notes']) ? $data['notes'] : '', PDO::PARAM_STR);
                 
                 if ($stmt->execute()) {
+                    if ($productIdsProvided && !is_null($new_product_ids)) {
+                        $this->syncOrderProducts((int)$data['id'], $new_product_ids, false);
+                    }
+
+                    if ($replacementIdsProvided) {
+                        $this->syncOrderProducts((int)$data['id'], $new_replacement_product_ids ?? [], true);
+                    }
+
                     // Check if payment status changed and create payment record if needed
                     if ($new_payment_status !== $existingOrder['payment_status'] || 
                         $new_final_cost !== floatval($existingOrder['final_cost']) ||
@@ -999,6 +1201,11 @@ class AdminAPI {
                 $deletePaymentsStmt = $this->conn->prepare($deletePaymentsQuery);
                 $deletePaymentsStmt->bindValue(':order_id', $id, PDO::PARAM_INT);
                 $deletePaymentsStmt->execute();
+
+                $deleteProductsQuery = "DELETE FROM service_order_products WHERE order_id = :order_id";
+                $deleteProductsStmt = $this->conn->prepare($deleteProductsQuery);
+                $deleteProductsStmt->bindValue(':order_id', $id, PDO::PARAM_INT);
+                $deleteProductsStmt->execute();
                 
                 // Delete the order
                 $deleteOrderQuery = "DELETE FROM service_orders WHERE id = :id";
@@ -1257,51 +1464,258 @@ class AdminAPI {
             $this->sendError("Failed to get products: " . $e->getMessage(), 500);
         }
     }
+
+    private function getProductStockColumn() {
+        if ($this->productStockColumn !== null) {
+            return $this->productStockColumn;
+        }
+
+        try {
+            $query = "SELECT COLUMN_NAME
+                      FROM information_schema.COLUMNS
+                      WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'products'
+                      AND COLUMN_NAME IN ('stock_quantity', 'quantity')";
+            $stmt = $this->conn->query($query);
+            $columns = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+            if (in_array('stock_quantity', $columns, true)) {
+                $this->productStockColumn = 'stock_quantity';
+            } elseif (in_array('quantity', $columns, true)) {
+                $this->productStockColumn = 'quantity';
+            } else {
+                $this->productStockColumn = '';
+            }
+        } catch (Exception $e) {
+            $this->productStockColumn = '';
+        }
+
+        return $this->productStockColumn;
+    }
+
+    private function hasProductMinStockLevel() {
+        if ($this->hasMinStockLevel !== null) {
+            return $this->hasMinStockLevel;
+        }
+
+        try {
+            $query = "SELECT COUNT(*)
+                      FROM information_schema.COLUMNS
+                      WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'products'
+                      AND COLUMN_NAME = 'min_stock_level'";
+            $stmt = $this->conn->query($query);
+            $this->hasMinStockLevel = ((int)$stmt->fetchColumn() === 1);
+        } catch (Exception $e) {
+            $this->hasMinStockLevel = false;
+        }
+
+        return $this->hasMinStockLevel;
+    }
+
+    private function hasProductSpareFlagColumn() {
+        if ($this->hasSpareProductFlag !== null) {
+            return $this->hasSpareProductFlag;
+        }
+
+        try {
+            $query = "SELECT COUNT(*)
+                      FROM information_schema.COLUMNS
+                      WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'products'
+                      AND COLUMN_NAME = 'is_spare_product'";
+            $stmt = $this->conn->query($query);
+            $this->hasSpareProductFlag = ((int)$stmt->fetchColumn() === 1);
+        } catch (Exception $e) {
+            $this->hasSpareProductFlag = false;
+        }
+
+        return $this->hasSpareProductFlag;
+    }
+
+    private function toIntBool($value, $default = 0) {
+        if ($value === null) {
+            return (int)$default;
+        }
+
+        if (is_bool($value)) {
+            return $value ? 1 : 0;
+        }
+
+        if (is_numeric($value)) {
+            return ((int)$value) ? 1 : 0;
+        }
+
+        $normalized = strtolower(trim((string)$value));
+        return in_array($normalized, ['1', 'true', 'yes', 'on'], true) ? 1 : 0;
+    }
     
     private function createProduct() {
         try {
             $data = json_decode(file_get_contents("php://input"), true);
+            if (!is_array($data)) {
+                $data = $_POST;
+            }
+            if (!is_array($data)) {
+                $data = [];
+            }
             
-            if (empty($data['product_name'])) {
-                $this->sendError("Product name is required", 400);
+            $stockColumn = $this->getProductStockColumn();
+            $hasMinStockLevel = $this->hasProductMinStockLevel();
+            $hasSpareFlag = $this->hasProductSpareFlagColumn();
+
+            $insertProduct = function(array $row) use ($stockColumn, $hasMinStockLevel, $hasSpareFlag): array {
+                $row = $this->normalizeProductPayload($row);
+
+                if (empty($row['product_name']) || trim((string)$row['product_name']) === '') {
+                    return ['success' => false, 'message' => 'Product name is required'];
+                }
+
+                $product_code = 'PRD' . date('Ymd') . strtoupper(substr(uniqid(), -6));
+
+                $columns = [
+                    'product_code', 'product_name', 'brand', 'model', 'category',
+                    'specifications', 'purchase_date', 'warranty_period', 'price'
+                ];
+                $placeholders = [
+                    ':product_code', ':product_name', ':brand', ':model', ':category',
+                    ':specifications', ':purchase_date', ':warranty_period', ':price'
+                ];
+
+                if ($stockColumn !== '') {
+                    $columns[] = $stockColumn;
+                    $placeholders[] = ':stock_value';
+                }
+                if ($hasMinStockLevel) {
+                    $columns[] = 'min_stock_level';
+                    $placeholders[] = ':min_stock_level';
+                }
+                if ($hasSpareFlag) {
+                    $columns[] = 'is_spare_product';
+                    $placeholders[] = ':is_spare_product';
+                }
+
+                $columns[] = 'status';
+                $columns[] = 'created_at';
+                $placeholders[] = ':status';
+                $placeholders[] = 'NOW()';
+
+                $query = "INSERT INTO products (" . implode(', ', $columns) . ")
+                         VALUES (" . implode(', ', $placeholders) . ")";
+
+                $stmt = $this->conn->prepare($query);
+                $stmt->bindValue(':product_code', $product_code, PDO::PARAM_STR);
+                $stmt->bindValue(':product_name', trim((string)$row['product_name']), PDO::PARAM_STR);
+                $stmt->bindValue(':brand', isset($row['brand']) ? $row['brand'] : '', PDO::PARAM_STR);
+                $stmt->bindValue(':model', isset($row['model']) ? $row['model'] : '', PDO::PARAM_STR);
+                $stmt->bindValue(':category', isset($row['category']) ? $row['category'] : 'laptop', PDO::PARAM_STR);
+                $stmt->bindValue(':specifications', isset($row['specifications']) ? $row['specifications'] : '', PDO::PARAM_STR);
+                $stmt->bindValue(':purchase_date', isset($row['purchase_date']) ? $row['purchase_date'] : date('Y-m-d'), PDO::PARAM_STR);
+                $stmt->bindValue(':warranty_period', isset($row['warranty_period']) ? $row['warranty_period'] : '1 year', PDO::PARAM_STR);
+                $stmt->bindValue(':price', isset($row['price']) ? $row['price'] : '0', PDO::PARAM_STR);
+                if ($stockColumn !== '') {
+                    $stockValue = isset($row['stock_quantity']) ? (int)$row['stock_quantity'] : (isset($row['quantity']) ? (int)$row['quantity'] : 0);
+                    $stmt->bindValue(':stock_value', $stockValue, PDO::PARAM_INT);
+                }
+                if ($hasMinStockLevel) {
+                    $stmt->bindValue(':min_stock_level', isset($row['min_stock_level']) ? (int)$row['min_stock_level'] : 5, PDO::PARAM_INT);
+                }
+                if ($hasSpareFlag) {
+                    $spareFlag = $this->toIntBool($row['is_spare_product'] ?? 0, 0);
+                    $stmt->bindValue(':is_spare_product', $spareFlag, PDO::PARAM_INT);
+                }
+                $stmt->bindValue(':status', isset($row['status']) ? $row['status'] : 'active', PDO::PARAM_STR);
+
+                if (!$stmt->execute()) {
+                    return ['success' => false, 'message' => 'Failed to create product'];
+                }
+
+                return [
+                    'success' => true,
+                    'product_id' => (int)$this->conn->lastInsertId(),
+                    'product_code' => $product_code,
+                    'product_name' => trim((string)$row['product_name'])
+                ];
+            };
+
+            $isBatch = isset($data['products']) && is_array($data['products']);
+            if ($isBatch) {
+                $rows = $data['products'];
+                if (count($rows) === 0) {
+                    $this->sendError("Products array is empty", 400);
+                    return;
+                }
+
+                $createdProducts = [];
+                $errors = [];
+
+                foreach ($rows as $index => $row) {
+                    if (!is_array($row)) {
+                        $errors[] = ['index' => $index, 'message' => 'Invalid row format'];
+                        continue;
+                    }
+
+                    $normalizedRow = $this->normalizeProductPayload($row);
+                    $result = $insertProduct($normalizedRow);
+                    if (!empty($result['success'])) {
+                        $createdProducts[] = [
+                            'index' => $index,
+                            'product_name' => $result['product_name'],
+                            'product_id' => $result['product_id'],
+                            'product_code' => $result['product_code']
+                        ];
+                    } else {
+                        $errors[] = [
+                            'index' => $index,
+                            'product_name' => isset($normalizedRow['product_name']) ? trim((string)$normalizedRow['product_name']) : '',
+                            'message' => $result['message'] ?? 'Failed to create product'
+                        ];
+                    }
+                }
+
+                $createdCount = count($createdProducts);
+                $failedCount = count($errors);
+                $allSuccess = $createdCount > 0 && $failedCount === 0;
+
+                if ($createdCount === 0) {
+                    http_response_code(400);
+                    echo json_encode([
+                        'success' => false,
+                        'message' => 'No products were created',
+                        'created_count' => 0,
+                        'failed_count' => $failedCount,
+                        'errors' => $errors
+                    ]);
+                    return;
+                }
+
+                http_response_code($allSuccess ? 201 : 207);
+                echo json_encode([
+                    'success' => $allSuccess,
+                    'partial' => !$allSuccess,
+                    'message' => $allSuccess
+                        ? 'All products created successfully'
+                        : 'Some products were created, but some rows failed',
+                    'created_count' => $createdCount,
+                    'failed_count' => $failedCount,
+                    'created_products' => $createdProducts,
+                    'errors' => $errors
+                ]);
                 return;
             }
-            
-            // Generate product code
-            $product_code = 'PRD' . date('Ymd') . strtoupper(substr(uniqid(), -6));
-            
-            $query = "INSERT INTO products (product_code, product_name, brand, model, category,
-                     specifications, purchase_date, warranty_period, price, stock_quantity,
-                     min_stock_level, status, created_at)
-                     VALUES (:product_code, :product_name, :brand, :model, :category,
-                     :specifications, :purchase_date, :warranty_period, :price, :stock_quantity,
-                     :min_stock_level, :status, NOW())";
-            
-            $stmt = $this->conn->prepare($query);
-            $stmt->bindValue(':product_code', $product_code, PDO::PARAM_STR);
-            $stmt->bindValue(':product_name', $data['product_name'], PDO::PARAM_STR);
-            $stmt->bindValue(':brand', isset($data['brand']) ? $data['brand'] : '', PDO::PARAM_STR);
-            $stmt->bindValue(':model', isset($data['model']) ? $data['model'] : '', PDO::PARAM_STR);
-            $stmt->bindValue(':category', isset($data['category']) ? $data['category'] : 'laptop', PDO::PARAM_STR);
-            $stmt->bindValue(':specifications', isset($data['specifications']) ? $data['specifications'] : '', PDO::PARAM_STR);
-            $stmt->bindValue(':purchase_date', isset($data['purchase_date']) ? $data['purchase_date'] : date('Y-m-d'), PDO::PARAM_STR);
-            $stmt->bindValue(':warranty_period', isset($data['warranty_period']) ? $data['warranty_period'] : '1 year', PDO::PARAM_STR);
-            $stmt->bindValue(':price', isset($data['price']) ? $data['price'] : '0', PDO::PARAM_STR);
-            $stmt->bindValue(':stock_quantity', isset($data['stock_quantity']) ? (int)$data['stock_quantity'] : 0, PDO::PARAM_INT);
-            $stmt->bindValue(':min_stock_level', isset($data['min_stock_level']) ? (int)$data['min_stock_level'] : 5, PDO::PARAM_INT);
-            $stmt->bindValue(':status', isset($data['status']) ? $data['status'] : 'active', PDO::PARAM_STR);
-            
-            if ($stmt->execute()) {
-                $product_id = $this->conn->lastInsertId();
-                
+
+            $result = $insertProduct($this->normalizeProductPayload($data));
+            if (!empty($result['success'])) {
+                http_response_code(201);
                 $this->sendSuccess([
                     'message' => 'Product created successfully',
-                    'product_id' => $product_id,
-                    'product_code' => $product_code
+                    'product_id' => $result['product_id'],
+                    'product_code' => $result['product_code']
                 ]);
-            } else {
-                $this->sendError("Failed to create product", 500);
+                return;
             }
+
+            $this->sendError($result['message'] ?? 'Failed to create product', 400);
             
         } catch (Exception $e) {
             $this->sendError("Failed to create product: " . $e->getMessage(), 500);
@@ -1311,6 +1725,13 @@ class AdminAPI {
     private function updateProduct() {
         try {
             $data = json_decode(file_get_contents("php://input"), true);
+            if (!is_array($data)) {
+                $data = $_POST;
+            }
+            if (!is_array($data)) {
+                $data = [];
+            }
+            $data = $this->normalizeProductPayload($data);
             
             if (empty($data['id'])) {
                 $this->sendError("Product ID is required", 400);
@@ -1318,33 +1739,74 @@ class AdminAPI {
             }
             
             // Check if product exists
-            $checkQuery = "SELECT id FROM products WHERE id = :id";
+            $checkQuery = "SELECT * FROM products WHERE id = :id";
             $checkStmt = $this->conn->prepare($checkQuery);
             $checkStmt->bindValue(':id', $data['id'], PDO::PARAM_INT);
             $checkStmt->execute();
+            $existingProduct = $checkStmt->fetch(PDO::FETCH_ASSOC);
             
-            if ($checkStmt->rowCount() === 0) {
+            if (!$existingProduct) {
                 $this->sendError("Product not found", 404);
                 return;
             }
             
-            $query = "UPDATE products SET product_name = :product_name, brand = :brand,
-                     model = :model, category = :category, specifications = :specifications,
-                     price = :price, stock_quantity = :stock_quantity, 
-                     min_stock_level = :min_stock_level, status = :status,
-                     updated_at = NOW() WHERE id = :id";
+            $stockColumn = $this->getProductStockColumn();
+            $hasMinStockLevel = $this->hasProductMinStockLevel();
+            $hasSpareFlag = $this->hasProductSpareFlagColumn();
+
+            $setParts = [
+                "product_name = :product_name",
+                "brand = :brand",
+                "model = :model",
+                "category = :category",
+                "specifications = :specifications",
+                "price = :price"
+            ];
+            if ($stockColumn !== '') {
+                $setParts[] = $stockColumn . " = :stock_value";
+            }
+            if ($hasMinStockLevel) {
+                $setParts[] = "min_stock_level = :min_stock_level";
+            }
+            if ($hasSpareFlag) {
+                $setParts[] = "is_spare_product = :is_spare_product";
+            }
+            $setParts[] = "status = :status";
+            $setParts[] = "updated_at = NOW()";
+
+            $query = "UPDATE products SET " . implode(', ', $setParts) . " WHERE id = :id";
             
             $stmt = $this->conn->prepare($query);
+            $productName = isset($data['product_name']) && trim((string)$data['product_name']) !== ''
+                ? trim((string)$data['product_name'])
+                : (string)($existingProduct['product_name'] ?? '');
+            $priceValue = isset($data['price']) && trim((string)$data['price']) !== ''
+                ? $data['price']
+                : ($existingProduct['price'] ?? 0);
+
             $stmt->bindValue(':id', $data['id'], PDO::PARAM_INT);
-            $stmt->bindValue(':product_name', $data['product_name'], PDO::PARAM_STR);
-            $stmt->bindValue(':brand', isset($data['brand']) ? $data['brand'] : '', PDO::PARAM_STR);
-            $stmt->bindValue(':model', isset($data['model']) ? $data['model'] : '', PDO::PARAM_STR);
-            $stmt->bindValue(':category', isset($data['category']) ? $data['category'] : 'laptop', PDO::PARAM_STR);
-            $stmt->bindValue(':specifications', isset($data['specifications']) ? $data['specifications'] : '', PDO::PARAM_STR);
-            $stmt->bindValue(':price', $data['price'], PDO::PARAM_STR);
-            $stmt->bindValue(':stock_quantity', isset($data['stock_quantity']) ? (int)$data['stock_quantity'] : 0, PDO::PARAM_INT);
-            $stmt->bindValue(':min_stock_level', isset($data['min_stock_level']) ? (int)$data['min_stock_level'] : 5, PDO::PARAM_INT);
-            $stmt->bindValue(':status', isset($data['status']) ? $data['status'] : 'active', PDO::PARAM_STR);
+            $stmt->bindValue(':product_name', $productName, PDO::PARAM_STR);
+            $stmt->bindValue(':brand', isset($data['brand']) ? $data['brand'] : ($existingProduct['brand'] ?? ''), PDO::PARAM_STR);
+            $stmt->bindValue(':model', isset($data['model']) ? $data['model'] : ($existingProduct['model'] ?? ''), PDO::PARAM_STR);
+            $stmt->bindValue(':category', isset($data['category']) ? $data['category'] : ($existingProduct['category'] ?? 'laptop'), PDO::PARAM_STR);
+            $stmt->bindValue(':specifications', isset($data['specifications']) ? $data['specifications'] : ($existingProduct['specifications'] ?? ''), PDO::PARAM_STR);
+            $stmt->bindValue(':price', $priceValue, PDO::PARAM_STR);
+            if ($stockColumn !== '') {
+                $stockValue = isset($data['stock_quantity'])
+                    ? (int)$data['stock_quantity']
+                    : (isset($data['quantity'])
+                        ? (int)$data['quantity']
+                        : (int)($existingProduct[$stockColumn] ?? 0));
+                $stmt->bindValue(':stock_value', $stockValue, PDO::PARAM_INT);
+            }
+            if ($hasMinStockLevel) {
+                $stmt->bindValue(':min_stock_level', isset($data['min_stock_level']) ? (int)$data['min_stock_level'] : (int)($existingProduct['min_stock_level'] ?? 5), PDO::PARAM_INT);
+            }
+            if ($hasSpareFlag) {
+                $spareFlag = $this->toIntBool($data['is_spare_product'] ?? ($existingProduct['is_spare_product'] ?? 0), 0);
+                $stmt->bindValue(':is_spare_product', $spareFlag, PDO::PARAM_INT);
+            }
+            $stmt->bindValue(':status', isset($data['status']) ? $data['status'] : ($existingProduct['status'] ?? 'active'), PDO::PARAM_STR);
             
             if ($stmt->execute()) {
                 $this->sendSuccess(['message' => 'Product updated successfully']);
