@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // C:\xampp\htdocs\sun_computers\api\admin_api.php
 
 // Enable CORS
@@ -116,6 +116,18 @@ class AdminAPI {
                     break;
                 }
             }
+        }
+
+        if ((!array_key_exists('serial_number', $row) || trim((string)$row['serial_number']) === '')) {
+            $serialAliasKeys = ['serialNumber', 'serial_no', 'serialNo', 'serial'];
+            foreach ($serialAliasKeys as $aliasKey) {
+                if (isset($row[$aliasKey]) && trim((string)$row[$aliasKey]) !== '') {
+                    $row['serial_number'] = trim((string)$row[$aliasKey]);
+                    break;
+                }
+            }
+        } elseif (isset($row['serial_number'])) {
+            $row['serial_number'] = trim((string)$row['serial_number']);
         }
 
         return $row;
@@ -1574,11 +1586,11 @@ class AdminAPI {
                 $product_code = 'PRD' . date('Ymd') . strtoupper(substr(uniqid(), -6));
 
                 $columns = [
-                    'product_code', 'product_name', 'brand', 'model', 'category',
+                    'product_code', 'serial_number', 'product_name', 'brand', 'model', 'category',
                     'specifications', 'purchase_date', 'warranty_period', 'price'
                 ];
                 $placeholders = [
-                    ':product_code', ':product_name', ':brand', ':model', ':category',
+                    ':product_code', ':serial_number', ':product_name', ':brand', ':model', ':category',
                     ':specifications', ':purchase_date', ':warranty_period', ':price'
                 ];
 
@@ -1605,6 +1617,11 @@ class AdminAPI {
 
                 $stmt = $this->conn->prepare($query);
                 $stmt->bindValue(':product_code', $product_code, PDO::PARAM_STR);
+                $serialNumber = trim((string)($row['serial_number'] ?? ''));
+                if ($serialNumber === '') {
+                    return ['success' => false, 'message' => 'Serial number is required'];
+                }
+                $stmt->bindValue(':serial_number', $serialNumber, PDO::PARAM_STR);
                 $stmt->bindValue(':product_name', trim((string)$row['product_name']), PDO::PARAM_STR);
                 $stmt->bindValue(':brand', isset($row['brand']) ? $row['brand'] : '', PDO::PARAM_STR);
                 $stmt->bindValue(':model', isset($row['model']) ? $row['model'] : '', PDO::PARAM_STR);
@@ -2216,7 +2233,7 @@ class AdminAPI {
                 [
                     'id' => 3,
                     'title' => 'Payment Received',
-                    'message' => '₹5000 payment received for order ORD2026011151E14B',
+                    'message' => 'â‚¹5000 payment received for order ORD2026011151E14B',
                     'type' => 'success',
                     'is_read' => true,
                     'created_at' => date('Y-m-d H:i:s', strtotime('-1 hour')),
@@ -2354,3 +2371,4 @@ try {
     ]);
 }
 ?>
+

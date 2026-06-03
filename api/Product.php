@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 // Product.php - UPDATED WITH SERIAL NUMBER, CLAIM TYPE, AND "NONE" OPTION
 
 // Enable error reporting
@@ -55,24 +55,7 @@ function expandProductRowsBySerial($row) {
     if (!is_array($row)) {
         return [];
     }
-
-    $serials = array_key_exists('serial_number', $row)
-        ? splitSerialInputValues($row['serial_number'])
-        : [];
-
-    if (count($serials) <= 1) {
-        $row['serial_number'] = count($serials) === 1 ? $serials[0] : '';
-        return [$row];
-    }
-
-    $expandedRows = [];
-    foreach ($serials as $serial) {
-        $copy = $row;
-        $copy['serial_number'] = $serial;
-        $expandedRows[] = $copy;
-    }
-
-    return $expandedRows;
+    return [$row];
 }
 
 function normalizeProductPayloadAliases($row) {
@@ -157,8 +140,8 @@ class Product {
     }
 
     private function normalizeSerialNumber($serial_number) {
-        $serial_number = trim((string)$serial_number);
-        return preg_replace('/\s+/', '', $serial_number);
+        $serial_number = str_replace(["\r\n", "\r"], "\n", (string)$serial_number);
+        return trim($serial_number);
     }
 
     private function normalizedSerialSql($columnName = 'serial_number') {
@@ -553,16 +536,6 @@ try {
 
             $isBatch = isset($input['products']) && is_array($input['products']);
 
-            if (!$isBatch) {
-                $expandedInputRows = expandProductRowsBySerial($input);
-                if (count($expandedInputRows) > 1) {
-                    $isBatch = true;
-                    $input = ['products' => $expandedInputRows];
-                } elseif (count($expandedInputRows) === 1) {
-                    $input = $expandedInputRows[0];
-                }
-            }
-
             if ($isBatch) {
                 $rawRows = $input['products'];
                 if (count($rawRows) === 0) {
@@ -582,11 +555,8 @@ try {
                     }
 
                     $row = normalizeProductPayloadAliases($row);
-                    $expandedRows = expandProductRowsBySerial($row);
-                    foreach ($expandedRows as $expandedRow) {
-                        $expandedRow['__source_index'] = $index;
-                        $rows[] = $expandedRow;
-                    }
+                    $row['__source_index'] = $index;
+                    $rows[] = $row;
                 }
 
                 foreach ($rows as $index => $row) {
@@ -716,19 +686,6 @@ try {
 
             $input = normalizeProductPayloadAliases($input);
 
-            if (isset($input['serial_number'])) {
-                $serialEntries = splitSerialInputValues($input['serial_number']);
-                if (count($serialEntries) > 1) {
-                    http_response_code(400);
-                    echo json_encode([
-                        "success" => false,
-                        "message" => "Only one serial number is allowed while editing a product"
-                    ]);
-                    break;
-                }
-                $input['serial_number'] = count($serialEntries) === 1 ? $serialEntries[0] : '';
-            }
-            
             // Verify product exists
             $existingProduct = $product->getById($id);
             if(!$existingProduct) {
@@ -802,4 +759,5 @@ try {
     ]);
 }
 ?>
+
 
