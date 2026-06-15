@@ -23,12 +23,171 @@ function formatNullableDate($value, $format = 'd/m/Y') {
     return date($format, strtotime($value));
 }
 
+function normalizeClaimTypeValue($claimType): string {
+    return str_replace(' ', '_', strtolower(trim((string) $claimType)));
+}
+
+function normalizeStatusValue($status): string {
+    $normalizedStatus = strtolower(trim((string) $status));
+    return $normalizedStatus === '' ? 'pending' : $normalizedStatus;
+}
+
+function buildSyntheticClaimId(int $serviceOrderId, int $sourceProductId): int {
+    return ($serviceOrderId * 1000000) + $sourceProductId;
+}
+
+function loadSourceProductNameMap(PDO $conn): array {
+    $stmt = $conn->prepare("SELECT id, product_name FROM products");
+    $stmt->execute();
+
+    $productNameMap = [];
+    while ($product = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $productId = (int) ($product['id'] ?? 0);
+        if ($productId <= 0) {
+            continue;
+        }
+
+        $productNameMap[$productId] = trim((string) ($product['product_name'] ?? ''));
+    }
+
+    return $productNameMap;
+}
+
+function buildShopClaimRow(
+    array $order,
+    int $sourceProductId,
+    array $claimDetails,
+    array $sourceProductNameMap
+): array {
+    $serviceOrderId = (int) ($order['id'] ?? 0);
+    $orderStatus = normalizeStatusValue($order['status'] ?? '');
+    $sourceProductName = trim((string) ($sourceProductNameMap[$sourceProductId] ?? ''));
+
+    return [
+        'id' => buildSyntheticClaimId($serviceOrderId, $sourceProductId),
+        'service_order_id' => $serviceOrderId,
+        'service_order_code' => (string) ($order['order_code'] ?? ('ORD' . $serviceOrderId)),
+        'source_product_id' => $sourceProductId,
+        'product_code' => sprintf('SCS%06dP%03d', $serviceOrderId, $sourceProductId),
+        'product_name' => trim((string) ($claimDetails['shop_claim_product_name'] ?? '')) ?: ($sourceProductName !== '' ? $sourceProductName : ('Claim Product ' . $sourceProductId)),
+        'source_product_name' => $sourceProductName,
+        'serial_number' => trim((string) ($claimDetails['shop_claim_serial_number'] ?? '')),
+        'is_spare_product' => 0,
+        'brand' => trim((string) ($claimDetails['shop_claim_brand'] ?? '')),
+        'model' => trim((string) ($claimDetails['shop_claim_model'] ?? '')),
+        'category' => 'service',
+        'claim_type' => 'shop_claim',
+        'shop_claim_product_name' => trim((string) ($claimDetails['shop_claim_product_name'] ?? '')),
+        'shop_claim_brand' => trim((string) ($claimDetails['shop_claim_brand'] ?? '')),
+        'shop_claim_model' => trim((string) ($claimDetails['shop_claim_model'] ?? '')),
+        'shop_claim_serial_number' => trim((string) ($claimDetails['shop_claim_serial_number'] ?? '')),
+        'specifications' => (string) ($order['issue_description'] ?? ''),
+        'purchase_date' => '',
+        'warranty_period' => '',
+        'warranty_status' => (string) ($order['warranty_status'] ?? 'active'),
+        'price' => '0',
+        'stock_quantity' => 0,
+        'min_stock_level' => 0,
+        'status' => $orderStatus,
+        'service_status' => $orderStatus,
+        'client_name' => trim((string) ($order['client_name'] ?? '')),
+        'client_phone' => trim((string) ($order['client_phone'] ?? '')),
+        'created_at' => (string) ($order['created_at'] ?? ''),
+        'updated_at' => (string) ($order['updated_at'] ?? ($order['created_at'] ?? '')),
+        'total_orders' => 1,
+        'purchase_date_formatted' => '',
+        'created_at_formatted' => formatNullableDate($order['created_at'] ?? '', 'd/m/Y h:i A'),
+        'updated_at_formatted' => formatNullableDate($order['updated_at'] ?? ($order['created_at'] ?? ''), 'd/m/Y h:i A'),
+    ];
+}
+
+function loadShopClaimRows(PDO $conn): array {
+    $query = "SELECT so.id,
+                     so.order_code,
+                     so.client_id,
+                     so.issue_description,
+                     so.warranty_status,
+                     so.status,
+                     so.created_at,
+                     so.updated_at,
+                     so.selected_product_claim_types,
+                     so.selected_product_claim_details,
+                     c.full_name AS client_name,
+                     c.phone AS client_phone
+              FROM service_orders so
+              LEFT JOIN clients c ON so.client_id = c.id
+              WHERE so.selected_product_claim_types IS NOT NULL
+                AND so.selected_product_claim_types <> ''
+              ORDER BY so.created_at DESC, so.id DESC";
+    $stmt = $conn->prepare($query);
+    $stmt->execute();
+
+    $sourceProductNameMap = loadSourceProductNameMap($conn);
+    $shopClaimRows = [];
+
+    while ($order = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $claimTypeMap = json_decode((string) ($order['selected_product_claim_types'] ?? ''), true);
+        $claimDetailsMap = json_decode((string) ($order['selected_product_claim_details'] ?? ''), true);
+
+        if (!is_array($claimTypeMap)) {
+            continue;
+        }
+
+        foreach ($claimTypeMap as $productId => $mappedClaimType) {
+            $sourceProductId = (int) $productId;
+            if ($sourceProductId <= 0) {
+                continue;
+            }
+
+            if (normalizeClaimTypeValue($mappedClaimType) !== 'shop_claim') {
+                continue;
+            }
+
+            $claimDetails = [];
+            if (isset($claimDetailsMap[$productId]) && is_array($claimDetailsMap[$productId])) {
+                $claimDetails = $claimDetailsMap[$productId];
+            }
+
+            $shopClaimRows[] = buildShopClaimRow($order, $sourceProductId, $claimDetails, $sourceProductNameMap);
+        }
+    }
+
+    return $shopClaimRows;
+}
+
+function matchesShopClaimSearch(array $product, string $search): bool {
+    if ($search === '') {
+        return true;
+    }
+
+    $needle = strtolower($search);
+    $searchableValues = [
+        $product['product_name'] ?? '',
+        $product['product_code'] ?? '',
+        $product['source_product_name'] ?? '',
+        $product['serial_number'] ?? '',
+        $product['brand'] ?? '',
+        $product['model'] ?? '',
+        $product['shop_claim_product_name'] ?? '',
+        $product['service_order_code'] ?? '',
+        $product['service_order_id'] ?? '',
+        $product['client_name'] ?? '',
+        $product['client_phone'] ?? '',
+        $product['status'] ?? '',
+    ];
+
+    foreach ($searchableValues as $value) {
+        if (strpos(strtolower((string) $value), $needle) !== false) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 try {
     $database = new Database();
     $conn = $database->getConnection();
-    if (!$conn) {
-        throw new Exception("Database connection failed");
-    }
 
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
         http_response_code(405);
@@ -36,81 +195,60 @@ try {
         exit();
     }
 
+    $shopClaimRows = loadShopClaimRows($conn);
+
     if (isset($_GET['id']) && $_GET['id'] !== '') {
-        $query = "SELECT * FROM products WHERE id = :id AND claim_type = 'shop_claim' LIMIT 1";
-        $stmt = $conn->prepare($query);
-        $stmt->bindValue(':id', (int) $_GET['id'], PDO::PARAM_INT);
-        $stmt->execute();
+        $requestedId = (int) $_GET['id'];
+        $matchedProduct = null;
 
-        $product = $stmt->fetch();
+        foreach ($shopClaimRows as $row) {
+            if ((int) ($row['id'] ?? 0) === $requestedId) {
+                $matchedProduct = $row;
+                break;
+            }
+        }
 
-        if (!$product) {
+        if ($matchedProduct === null) {
             http_response_code(404);
-            echo json_encode(["success" => false, "message" => "Shop claim product not found"]);
+            echo json_encode(["success" => false, "message" => "Shop claim service not found"]);
             exit();
         }
 
-        $product['purchase_date_formatted'] = formatNullableDate($product['purchase_date']);
-        $product['created_at_formatted'] = formatNullableDate($product['created_at'], 'd/m/Y h:i A');
-        $product['updated_at_formatted'] = formatNullableDate($product['updated_at'] ?? '', 'd/m/Y h:i A');
-        $product['brand'] = $product['brand'] ?? '';
-        $product['model'] = $product['model'] ?? '';
-        $product['specifications'] = $product['specifications'] ?? '';
-        $product['warranty_period'] = $product['warranty_period'] ?? '';
-        $product['is_spare_product'] = $product['is_spare_product'] ?? 0;
-
-        echo json_encode(["success" => true, "product" => $product]);
+        echo json_encode(["success" => true, "product" => $matchedProduct]);
         exit();
     }
 
-    $query = "SELECT * FROM products WHERE claim_type = 'shop_claim'";
-    $params = [];
+    $search = trim((string) ($_GET['search'] ?? ''));
+    $statusFilter = normalizeStatusValue($_GET['status'] ?? '');
+    $hasStatusFilter = isset($_GET['status']) && trim((string) $_GET['status']) !== '' && trim((string) $_GET['status']) !== 'all';
+    $startDate = trim((string) ($_GET['start_date'] ?? ''));
+    $endDate = trim((string) ($_GET['end_date'] ?? ''));
 
-    if (!empty($_GET['search'])) {
-        $query .= " AND (product_name LIKE :search OR product_code LIKE :search OR serial_number LIKE :search OR brand LIKE :search OR model LIKE :search)";
-        $params[':search'] = '%' . trim($_GET['search']) . '%';
-    }
+    $filteredProducts = array_values(array_filter($shopClaimRows, static function (array $product) use ($search, $hasStatusFilter, $statusFilter, $startDate, $endDate): bool {
+        if ($hasStatusFilter && normalizeStatusValue($product['status'] ?? '') !== $statusFilter) {
+            return false;
+        }
 
-    if (!empty($_GET['status']) && $_GET['status'] !== 'all') {
-        $query .= " AND status = :status";
-        $params[':status'] = trim($_GET['status']);
-    }
+        $createdDate = substr((string) ($product['created_at'] ?? ''), 0, 10);
+        if ($startDate !== '' && ($createdDate === '' || $createdDate < $startDate)) {
+            return false;
+        }
 
-    if (!empty($_GET['start_date'])) {
-        $query .= " AND DATE(created_at) >= :start_date";
-        $params[':start_date'] = $_GET['start_date'];
-    }
+        if ($endDate !== '' && ($createdDate === '' || $createdDate > $endDate)) {
+            return false;
+        }
 
-    if (!empty($_GET['end_date'])) {
-        $query .= " AND DATE(created_at) <= :end_date";
-        $params[':end_date'] = $_GET['end_date'];
-    }
+        return matchesShopClaimSearch($product, $search);
+    }));
 
-    $query .= " ORDER BY created_at DESC";
-
-    $stmt = $conn->prepare($query);
-    foreach ($params as $key => $value) {
-        $stmt->bindValue($key, $value);
-    }
-    $stmt->execute();
-
-    $products = $stmt->fetchAll();
-
-    foreach ($products as &$product) {
-        $product['purchase_date_formatted'] = formatNullableDate($product['purchase_date']);
-        $product['created_at_formatted'] = formatNullableDate($product['created_at'], 'd/m/Y h:i A');
-        $product['updated_at_formatted'] = formatNullableDate($product['updated_at'] ?? '', 'd/m/Y h:i A');
-        $product['brand'] = $product['brand'] ?? '';
-        $product['model'] = $product['model'] ?? '';
-        $product['specifications'] = $product['specifications'] ?? '';
-        $product['warranty_period'] = $product['warranty_period'] ?? '';
-        $product['is_spare_product'] = $product['is_spare_product'] ?? 0;
-    }
+    usort($filteredProducts, static function (array $left, array $right): int {
+        return strtotime((string) ($right['created_at'] ?? '')) <=> strtotime((string) ($left['created_at'] ?? ''));
+    });
 
     echo json_encode([
         "success" => true,
-        "count" => count($products),
-        "products" => $products
+        "count" => count($filteredProducts),
+        "products" => $filteredProducts
     ]);
 } catch (Exception $e) {
     http_response_code(500);

@@ -12,9 +12,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/helpers/jwt_helper.php';
-require_once __DIR__ . '/helpers/performance.php';
-
-apiEnableCompression();
 
 $database = new Database();
 $db = $database->getConnection();
@@ -100,9 +97,6 @@ function updateOrderPaymentStatus($db, $order_id) {
 try {
     switch ($method) {
         case 'GET':
-            if (apiServeCachedJson('payments', 5)) {
-                exit();
-            }
             // Get all payments or payments for specific order
             $order_id = isset($_GET['order_id']) ? $_GET['order_id'] : null;
             $page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
@@ -156,7 +150,7 @@ try {
                 
                 $balance = $order['final_cost'] - $total_paid;
                 
-                $response = json_encode([
+                echo json_encode([
                     "success" => true,
                     "payments" => $payments,
                     "summary" => [
@@ -170,8 +164,6 @@ try {
                     ],
                     "count" => count($payments)
                 ]);
-                apiCacheJsonResponse('payments', $response);
-                echo $response;
             } else {
                 // Get all payments with pagination
                 $countQuery = "SELECT COUNT(*) as total FROM payments";
@@ -201,7 +193,7 @@ try {
                 
                 $payments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 
-                $response = json_encode([
+                echo json_encode([
                     "success" => true,
                     "payments" => $payments,
                     "total" => (int)$total,
@@ -210,8 +202,6 @@ try {
                     "limit" => $limit,
                     "timestamp" => date('Y-m-d H:i:s')
                 ]);
-                apiCacheJsonResponse('payments', $response);
-                echo $response;
             }
             break;
             

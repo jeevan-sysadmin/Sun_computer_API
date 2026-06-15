@@ -26,9 +26,6 @@ function formatNullableDate($value, $format = 'd/m/Y') {
 try {
     $database = new Database();
     $conn = $database->getConnection();
-    if (!$conn) {
-        throw new Exception("Database connection failed");
-    }
 
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
         http_response_code(405);

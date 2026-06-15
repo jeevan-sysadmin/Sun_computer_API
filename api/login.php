@@ -14,18 +14,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 // Include required files
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/helpers/jwt_helper.php';
-require_once __DIR__ . '/helpers/performance.php';
 
-apiEnableCompression();
-
-// Keep API responses lean in production.
+// Set error reporting for development
 error_reporting(E_ALL);
-ini_set('display_errors', 0);
+ini_set('display_errors', 1);
 
 class LoginAPI {
     private $conn;
     private $data;
-    private static $usersTableChecked = false;
 
     public function __construct() {
         $database = new Database();
@@ -38,9 +34,9 @@ class LoginAPI {
         
         // Get input data
         $input = file_get_contents("php://input");
-        $this->data = $input !== '' ? json_decode($input) : null;
+        $this->data = json_decode($input);
         
-        if ($input !== '' && !$this->data && json_last_error() !== JSON_ERROR_NONE) {
+        if (!$this->data && json_last_error() !== JSON_ERROR_NONE) {
             $this->sendError("Invalid JSON input");
             exit();
         }
@@ -62,9 +58,13 @@ class LoginAPI {
                 return;
             }
 
-            if (!self::$usersTableChecked) {
-                $stmt = $this->conn->query("SELECT 1 FROM users LIMIT 1");
-                self::$usersTableChecked = true;
+            // Check if users table exists
+            $checkTable = "SHOW TABLES LIKE 'users'";
+            $stmt = $this->conn->query($checkTable);
+            
+            if ($stmt->rowCount() == 0) {
+                // Create default users if table doesn't exist
+                $this->createDefaultUsers();
             }
 
             // Prepare SQL query
@@ -101,21 +101,15 @@ class LoginAPI {
                         ];
                         $token = JWT::encode($tokenPayload);
                         
-                        // Normalize role to supported values only
-                        $role = $row['role'] === 'admin' ? 'admin' : 'user';
-
-                        // Keep response role consistent for frontend
-                        $row['role'] = $role;
-
                         // Determine redirect URL based on role
-                        $redirectUrl = '/admin-dashboard';
+                        $redirectUrl = $row['role'] === 'admin' ? '/admin-dashboard' : '/dashboard';
                         
                         // Send success response
                         $this->sendSuccess([
                             "user" => $row,
                             "token" => $token,
                             "redirect" => $redirectUrl,
-                            "role" => $role
+                            "role" => $row['role']
                         ]);
                     } else {
                         $this->sendError("Invalid email or password", 401);
@@ -127,18 +121,9 @@ class LoginAPI {
                 $this->sendError("Database query failed", 500);
             }
             
-        } catch (PDOException $e) {
-            if ($e->getCode() === '42S02') {
-                $this->createDefaultUsers();
-                self::$usersTableChecked = true;
-                $this->login();
-                return;
-            }
-            error_log("Login database error: " . $e->getMessage());
-            $this->sendError("Server error occurred", 500);
         } catch (Exception $e) {
             error_log("Login error: " . $e->getMessage());
-            $this->sendError("Server error occurred", 500);
+            $this->sendError("Server error occurred: " . $e->getMessage(), 500);
         }
     }
 
@@ -150,7 +135,7 @@ class LoginAPI {
                 `name` VARCHAR(100) NOT NULL,
                 `email` VARCHAR(100) UNIQUE NOT NULL,
                 `password` VARCHAR(255) NOT NULL,
-                `role` ENUM('admin', 'user') DEFAULT 'user',
+                `role` ENUM('admin', 'staff', 'user') DEFAULT 'user',
                 `is_active` TINYINT(1) DEFAULT 1,
                 `last_login` TIMESTAMP NULL,
                 `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -241,7 +226,7 @@ try {
                     "email" => "user@sun.com",
                     "password" => "user123",
                     "role" => "user",
-                    "redirects_to" => "/admin-dashboard"
+                    "redirects_to" => "/dashboard"
                 ]
             ]
         ]);

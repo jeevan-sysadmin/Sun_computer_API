@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 header("Access-Control-Allow-Origin: *");
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Methods: GET, OPTIONS");
@@ -23,217 +23,160 @@ function formatNullableDate($value, $format = 'd/m/Y') {
     return date($format, strtotime($value));
 }
 
-function tableExists($conn, $tableName) {
-    $stmt = $conn->prepare("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table LIMIT 1");
-    $stmt->bindValue(':table', $tableName, PDO::PARAM_STR);
+function normalizeClaimTypeValue($claimType): string {
+    return str_replace(' ', '_', strtolower(trim((string) $claimType)));
+}
+
+function normalizeStatusValue($status): string {
+    $normalizedStatus = strtolower(trim((string) $status));
+    return $normalizedStatus === '' ? 'pending' : $normalizedStatus;
+}
+
+function buildSyntheticClaimId(int $serviceOrderId, int $sourceProductId): int {
+    return ($serviceOrderId * 1000000) + $sourceProductId;
+}
+
+function loadSourceProductMap(PDO $conn): array {
+    $stmt = $conn->prepare("SELECT id, product_name, serial_number, brand, model, category FROM products");
     $stmt->execute();
-    return (bool)$stmt->fetchColumn();
-}
 
-function columnExists($conn, $tableName, $columnName) {
-    $stmt = $conn->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND COLUMN_NAME = :column LIMIT 1");
-    $stmt->bindValue(':table', $tableName, PDO::PARAM_STR);
-    $stmt->bindValue(':column', $columnName, PDO::PARAM_STR);
-    $stmt->execute();
-    return (bool)$stmt->fetchColumn();
-}
-
-function firstExistingColumn($conn, $tableName, $candidates) {
-    foreach ($candidates as $columnName) {
-        if (columnExists($conn, $tableName, $columnName)) {
-            return $columnName;
-        }
-    }
-    return null;
-}
-
-function normalizeIdList($value) {
-    if ($value === null) {
-        return [];
-    }
-
-    if (is_array($value)) {
-        $raw = $value;
-    } elseif (is_string($value)) {
-        $trimmed = trim($value);
-        if ($trimmed === '') {
-            return [];
-        }
-
-        $decoded = json_decode($trimmed, true);
-        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-            $raw = $decoded;
-        } else {
-            $raw = explode(',', $trimmed);
-        }
-    } else {
-        $raw = [$value];
-    }
-
-    $ids = [];
-    foreach ($raw as $entry) {
-        $id = (int)$entry;
-        if ($id > 0) {
-            $ids[] = $id;
-        }
-    }
-
-    return array_values(array_unique($ids));
-}
-
-function normalizeStatusValue($status) {
-    $value = strtolower(trim((string)$status));
-    $value = str_replace(['_', '-', ' '], '', $value);
-
-    if ($value === 'comtoraj' || $value === 'companytoraj') {
-        return 'comtoraj';
-    }
-
-    return $value;
-}
-
-function normalizeProductStatusMap($value) {
-    if (is_array($value)) {
-        $source = $value;
-    } elseif (is_string($value)) {
-        $trimmed = trim($value);
-        if ($trimmed === '') {
-            return [];
-        }
-
-        $decoded = json_decode($trimmed, true);
-        if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
-            return [];
-        }
-        $source = $decoded;
-    } else {
-        return [];
-    }
-
-    $map = [];
-    foreach ($source as $productId => $status) {
-        $id = (int)$productId;
-        if ($id <= 0) {
+    $productMap = [];
+    while ($product = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $productId = (int) ($product['id'] ?? 0);
+        if ($productId <= 0) {
             continue;
         }
-        $map[$id] = normalizeStatusValue($status);
+
+        $productMap[$productId] = [
+            'product_name' => trim((string) ($product['product_name'] ?? '')),
+            'serial_number' => trim((string) ($product['serial_number'] ?? '')),
+            'brand' => trim((string) ($product['brand'] ?? '')),
+            'model' => trim((string) ($product['model'] ?? '')),
+            'category' => trim((string) ($product['category'] ?? '')),
+        ];
     }
 
-    return $map;
+    return $productMap;
 }
 
-function buildLatestClientByProductMap($conn, $productIds) {
-    $productIds = array_values(array_unique(array_filter(array_map('intval', $productIds))));
-    if (empty($productIds)) {
-        return [];
-    }
+function buildCompanyToSunRow(array $order, int $sourceProductId, array $sourceProductMap): array {
+    $serviceOrderId = (int) ($order['id'] ?? 0);
+    $orderStatus = normalizeStatusValue($order['status'] ?? '');
+    $sourceProduct = $sourceProductMap[$sourceProductId] ?? [];
+    $sourceProductName = trim((string) ($sourceProduct['product_name'] ?? ''));
 
-    $targetSet = array_fill_keys($productIds, true);
-    $latestClientByProductId = [];
+    return [
+        'id' => buildSyntheticClaimId($serviceOrderId, $sourceProductId),
+        'service_order_id' => $serviceOrderId,
+        'service_order_code' => (string) ($order['order_code'] ?? ('ORD' . $serviceOrderId)),
+        'source_product_id' => $sourceProductId,
+        'product_code' => sprintf('CTS%06dP%03d', $serviceOrderId, $sourceProductId),
+        'product_name' => $sourceProductName !== '' ? $sourceProductName : ('Claim Product ' . $sourceProductId),
+        'source_product_name' => $sourceProductName,
+        'serial_number' => trim((string) ($sourceProduct['serial_number'] ?? '')),
+        'is_spare_product' => 0,
+        'brand' => trim((string) ($sourceProduct['brand'] ?? '')),
+        'model' => trim((string) ($sourceProduct['model'] ?? '')),
+        'category' => 'service',
+        'claim_type' => 'company_to_sun',
+        'specifications' => (string) ($order['issue_description'] ?? ''),
+        'purchase_date' => '',
+        'warranty_period' => '',
+        'warranty_status' => (string) ($order['warranty_status'] ?? 'active'),
+        'price' => '0',
+        'stock_quantity' => 0,
+        'min_stock_level' => 0,
+        'status' => $orderStatus,
+        'service_status' => $orderStatus,
+        'client_name' => trim((string) ($order['client_name'] ?? '')),
+        'client_phone' => trim((string) ($order['client_phone'] ?? '')),
+        'created_at' => (string) ($order['created_at'] ?? ''),
+        'updated_at' => (string) ($order['updated_at'] ?? ($order['created_at'] ?? '')),
+        'total_orders' => 1,
+        'purchase_date_formatted' => '',
+        'created_at_formatted' => formatNullableDate($order['created_at'] ?? '', 'd/m/Y h:i A'),
+        'updated_at_formatted' => formatNullableDate($order['updated_at'] ?? ($order['created_at'] ?? ''), 'd/m/Y h:i A'),
+    ];
+}
 
-    $hasSop = tableExists($conn, 'service_order_products')
-        && columnExists($conn, 'service_order_products', 'order_id')
-        && columnExists($conn, 'service_order_products', 'product_id');
-
-    $sopStatusColumn = null;
-    if ($hasSop) {
-        $sopStatusColumn = firstExistingColumn($conn, 'service_order_products', ['product_status', 'status', 'flow_status']);
-    }
-
-    $query = "SELECT so.id AS order_id,
+function loadCompanyToSunRows(PDO $conn): array {
+    $query = "SELECT so.id,
                      so.order_code,
-                     so.product_id,
-                     so.product_ids,
-                     so.product_status_map,
+                     so.client_id,
+                     so.issue_description,
+                     so.warranty_status,
+                     so.status,
                      so.created_at,
+                     so.updated_at,
+                     so.selected_product_claim_types,
                      c.full_name AS client_name,
-                     c.phone AS client_phone";
-
-    if ($hasSop) {
-        $query .= ", sop.product_id AS sop_product_id";
-        if ($sopStatusColumn !== null) {
-            $query .= ", sop.`{$sopStatusColumn}` AS sop_status";
-        }
-    }
-
-    $query .= "
+                     c.phone AS client_phone
               FROM service_orders so
-              LEFT JOIN clients c ON so.client_id = c.id";
-
-    if ($hasSop) {
-        $query .= "
-              LEFT JOIN service_order_products sop ON sop.order_id = so.id";
-    }
-
-    $query .= "
+              LEFT JOIN clients c ON so.client_id = c.id
+              WHERE so.selected_product_claim_types IS NOT NULL
+                AND so.selected_product_claim_types <> ''
               ORDER BY so.created_at DESC, so.id DESC";
-
     $stmt = $conn->prepare($query);
     $stmt->execute();
 
-    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-        $matchedProductIds = [];
+    $sourceProductMap = loadSourceProductMap($conn);
+    $rows = [];
 
-        $statusMap = normalizeProductStatusMap($row['product_status_map'] ?? []);
-        foreach ($statusMap as $productId => $status) {
-            if ($status === 'comtoraj' && isset($targetSet[$productId])) {
-                $matchedProductIds[] = (int)$productId;
-            }
-        }
-
-        if ($hasSop && isset($row['sop_product_id'])) {
-            $sopProductId = (int)$row['sop_product_id'];
-            $sopStatus = normalizeStatusValue($row['sop_status'] ?? '');
-            if ($sopProductId > 0 && isset($targetSet[$sopProductId]) && ($sopStatusColumn === null || $sopStatus === 'comtoraj')) {
-                $matchedProductIds[] = $sopProductId;
-            }
-        }
-
-        if (empty($matchedProductIds)) {
-            $fallbackIds = normalizeIdList($row['product_ids'] ?? []);
-            if (empty($fallbackIds) && !empty($row['product_id'])) {
-                $fallbackIds[] = (int)$row['product_id'];
-            }
-
-            foreach ($fallbackIds as $productId) {
-                if (isset($targetSet[$productId])) {
-                    $matchedProductIds[] = (int)$productId;
-                }
-            }
-        }
-
-        if (empty($matchedProductIds)) {
+    while ($order = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $claimTypeMap = json_decode((string) ($order['selected_product_claim_types'] ?? ''), true);
+        if (!is_array($claimTypeMap)) {
             continue;
         }
 
-        $matchedProductIds = array_values(array_unique(array_filter(array_map('intval', $matchedProductIds))));
-        foreach ($matchedProductIds as $productId) {
-            if (isset($latestClientByProductId[$productId])) {
+        foreach ($claimTypeMap as $productId => $mappedClaimType) {
+            $sourceProductId = (int) $productId;
+            if ($sourceProductId <= 0) {
                 continue;
             }
 
-            $latestClientByProductId[$productId] = [
-                'client_name' => (string)($row['client_name'] ?? ''),
-                'client_phone' => (string)($row['client_phone'] ?? ''),
-                'order_id' => (int)($row['order_id'] ?? 0),
-                'order_code' => (string)($row['order_code'] ?? ''),
-            ];
-        }
+            if (normalizeClaimTypeValue($mappedClaimType) !== 'company_to_sun') {
+                continue;
+            }
 
-        if (count($latestClientByProductId) >= count($productIds)) {
-            break;
+            $rows[] = buildCompanyToSunRow($order, $sourceProductId, $sourceProductMap);
         }
     }
 
-    return $latestClientByProductId;
+    return $rows;
+}
+
+function matchesCompanyToSunSearch(array $product, string $search): bool {
+    if ($search === '') {
+        return true;
+    }
+
+    $needle = strtolower($search);
+    $searchableValues = [
+        $product['product_name'] ?? '',
+        $product['product_code'] ?? '',
+        $product['source_product_name'] ?? '',
+        $product['serial_number'] ?? '',
+        $product['brand'] ?? '',
+        $product['model'] ?? '',
+        $product['service_order_code'] ?? '',
+        $product['service_order_id'] ?? '',
+        $product['client_name'] ?? '',
+        $product['client_phone'] ?? '',
+        $product['status'] ?? '',
+    ];
+
+    foreach ($searchableValues as $value) {
+        if (strpos(strtolower((string) $value), $needle) !== false) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 try {
     $database = new Database();
     $conn = $database->getConnection();
-    if (!$conn) {
-        throw new Exception("Database connection failed");
-    }
 
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
         http_response_code(405);
@@ -241,144 +184,60 @@ try {
         exit();
     }
 
-    // Only include products that are ComToRaj in service order flow.
-    $statusNormalizeExpr = "REPLACE(REPLACE(LOWER(TRIM(%s)), '_', ''), ' ', '')";
-    $filterParts = [];
-
-    if (tableExists($conn, 'service_order_products') && columnExists($conn, 'service_order_products', 'product_id')) {
-        $statusColumn = firstExistingColumn($conn, 'service_order_products', ['product_status', 'status', 'flow_status']);
-        if ($statusColumn !== null) {
-            $filterParts[] = "EXISTS (\n"
-                . "  SELECT 1 FROM service_order_products sop\n"
-                . "  WHERE sop.product_id = p.id\n"
-                . "    AND " . sprintf($statusNormalizeExpr, "sop.`" . $statusColumn . "`") . " = 'comtoraj'\n"
-                . ")";
-        }
-    }
-
-    if (tableExists($conn, 'service_orders') && columnExists($conn, 'service_orders', 'product_status_map')) {
-        $filterParts[] = "EXISTS (\n"
-            . "  SELECT 1 FROM service_orders so\n"
-            . "  WHERE so.product_status_map IS NOT NULL\n"
-            . "    AND " . sprintf($statusNormalizeExpr, "JSON_UNQUOTE(JSON_EXTRACT(so.product_status_map, CONCAT('$.\\\"', p.id, '\\\"')))") . " = 'comtoraj'\n"
-            . ")";
-    }
-
-    if (count($filterParts) > 0) {
-        $comToRajFilter = "(" . implode(" OR ", $filterParts) . ")";
-    } else {
-        $comToRajFilter = "(1 = 0)";
-    }
+    $rows = loadCompanyToSunRows($conn);
 
     if (isset($_GET['id']) && $_GET['id'] !== '') {
-        $query = "SELECT p.* FROM products p WHERE p.id = :id AND {$comToRajFilter} LIMIT 1";
-        $stmt = $conn->prepare($query);
-        $stmt->bindValue(':id', (int) $_GET['id'], PDO::PARAM_INT);
-        $stmt->execute();
+        $requestedId = (int) $_GET['id'];
+        $matchedProduct = null;
 
-        $product = $stmt->fetch();
+        foreach ($rows as $row) {
+            if ((int) ($row['id'] ?? 0) === $requestedId) {
+                $matchedProduct = $row;
+                break;
+            }
+        }
 
-        if (!$product) {
+        if ($matchedProduct === null) {
             http_response_code(404);
-            echo json_encode(["success" => false, "message" => "ComToRaj product not found"]);
+            echo json_encode(["success" => false, "message" => "Company to sun service not found"]);
             exit();
         }
 
-        $clientMap = buildLatestClientByProductMap($conn, [(int)$product['id']]);
-        $clientInfo = $clientMap[(int)$product['id']] ?? [
-            'client_name' => '',
-            'client_phone' => '',
-            'order_id' => 0,
-            'order_code' => '',
-        ];
-
-        $product['purchase_date_formatted'] = formatNullableDate($product['purchase_date']);
-        $product['created_at_formatted'] = formatNullableDate($product['created_at'], 'd/m/Y h:i A');
-        $product['updated_at_formatted'] = formatNullableDate($product['updated_at'] ?? '', 'd/m/Y h:i A');
-        $product['brand'] = $product['brand'] ?? '';
-        $product['model'] = $product['model'] ?? '';
-        $product['specifications'] = $product['specifications'] ?? '';
-        $product['warranty_period'] = $product['warranty_period'] ?? '';
-        $product['is_spare_product'] = $product['is_spare_product'] ?? 0;
-        $product['client_name'] = $clientInfo['client_name'];
-        $product['client_phone'] = $clientInfo['client_phone'];
-        $product['order_id'] = $clientInfo['order_id'];
-        $product['order_code'] = $clientInfo['order_code'];
-
-        echo json_encode([
-            "success" => true,
-            "label" => "Company To Raj Products",
-            "product" => $product
-        ]);
+        echo json_encode(["success" => true, "product" => $matchedProduct]);
         exit();
     }
 
-    $query = "SELECT p.* FROM products p WHERE {$comToRajFilter}";
-    $params = [];
+    $search = trim((string) ($_GET['search'] ?? ''));
+    $statusFilter = normalizeStatusValue($_GET['status'] ?? '');
+    $hasStatusFilter = isset($_GET['status']) && trim((string) $_GET['status']) !== '' && trim((string) $_GET['status']) !== 'all';
+    $startDate = trim((string) ($_GET['start_date'] ?? ''));
+    $endDate = trim((string) ($_GET['end_date'] ?? ''));
 
-    if (!empty($_GET['search'])) {
-        $query .= " AND (p.product_name LIKE :search OR p.product_code LIKE :search OR p.serial_number LIKE :search OR p.brand LIKE :search OR p.model LIKE :search)";
-        $params[':search'] = '%' . trim($_GET['search']) . '%';
-    }
+    $filteredProducts = array_values(array_filter($rows, static function (array $product) use ($search, $hasStatusFilter, $statusFilter, $startDate, $endDate): bool {
+        if ($hasStatusFilter && normalizeStatusValue($product['status'] ?? '') !== $statusFilter) {
+            return false;
+        }
 
-    if (!empty($_GET['status']) && $_GET['status'] !== 'all') {
-        $query .= " AND p.status = :status";
-        $params[':status'] = trim($_GET['status']);
-    }
+        $createdDate = substr((string) ($product['created_at'] ?? ''), 0, 10);
+        if ($startDate !== '' && ($createdDate === '' || $createdDate < $startDate)) {
+            return false;
+        }
 
-    if (!empty($_GET['start_date'])) {
-        $query .= " AND DATE(p.created_at) >= :start_date";
-        $params[':start_date'] = $_GET['start_date'];
-    }
+        if ($endDate !== '' && ($createdDate === '' || $createdDate > $endDate)) {
+            return false;
+        }
 
-    if (!empty($_GET['end_date'])) {
-        $query .= " AND DATE(p.created_at) <= :end_date";
-        $params[':end_date'] = $_GET['end_date'];
-    }
+        return matchesCompanyToSunSearch($product, $search);
+    }));
 
-    $query .= " ORDER BY p.created_at DESC";
-
-    $stmt = $conn->prepare($query);
-    foreach ($params as $key => $value) {
-        $stmt->bindValue($key, $value);
-    }
-    $stmt->execute();
-
-    $products = $stmt->fetchAll();
-    $productIds = array_values(array_unique(array_filter(array_map(function ($product) {
-        return (int)($product['id'] ?? 0);
-    }, $products))));
-    $clientMap = buildLatestClientByProductMap($conn, $productIds);
-
-    foreach ($products as &$product) {
-        $productId = (int)($product['id'] ?? 0);
-        $clientInfo = $clientMap[$productId] ?? [
-            'client_name' => '',
-            'client_phone' => '',
-            'order_id' => 0,
-            'order_code' => '',
-        ];
-
-        $product['purchase_date_formatted'] = formatNullableDate($product['purchase_date']);
-        $product['created_at_formatted'] = formatNullableDate($product['created_at'], 'd/m/Y h:i A');
-        $product['updated_at_formatted'] = formatNullableDate($product['updated_at'] ?? '', 'd/m/Y h:i A');
-        $product['brand'] = $product['brand'] ?? '';
-        $product['model'] = $product['model'] ?? '';
-        $product['specifications'] = $product['specifications'] ?? '';
-        $product['warranty_period'] = $product['warranty_period'] ?? '';
-        $product['is_spare_product'] = $product['is_spare_product'] ?? 0;
-        $product['client_name'] = $clientInfo['client_name'];
-        $product['client_phone'] = $clientInfo['client_phone'];
-        $product['order_id'] = $clientInfo['order_id'];
-        $product['order_code'] = $clientInfo['order_code'];
-    }
-    unset($product);
+    usort($filteredProducts, static function (array $left, array $right): int {
+        return strtotime((string) ($right['created_at'] ?? '')) <=> strtotime((string) ($left['created_at'] ?? ''));
+    });
 
     echo json_encode([
         "success" => true,
-        "label" => "Company To Raj Products",
-        "count" => count($products),
-        "products" => $products
+        "count" => count($filteredProducts),
+        "products" => $filteredProducts
     ]);
 } catch (Exception $e) {
     http_response_code(500);

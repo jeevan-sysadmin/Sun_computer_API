@@ -42,7 +42,7 @@ function expense_record_by_id(PDO $db, int $id): ?array {
 }
 
 $db = finance_connection();
-$user = finance_user(false);
+$user = finance_user(true);
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
