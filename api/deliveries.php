@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // Set headers for CORS
 header("Access-Control-Allow-Origin: *");
 header("Content-Type: application/json; charset=UTF-8");
@@ -14,7 +14,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 
 // Error reporting for development
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+// Keep API responses valid JSON (log errors, don't print HTML notices/warnings)
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
 
 require_once __DIR__ . '/config/database.php';
 
@@ -102,31 +104,326 @@ switch ($method) {
         break;
 }
 
+function normalizeFlowStatus($value) {
+    $normalized = strtolower(trim((string)$value));
+    if ($normalized === 'deliveryed' || $normalized === 'delivered') {
+        return 'deliveryed';
+    }
+    if ($normalized === 'rajtocom') {
+        return 'rajtocom';
+    }
+    if ($normalized === 'comtoraj') {
+        return 'comtoraj';
+    }
+    return 'pending';
+}
+
+function normalizeDeliveryType($value) {
+    $normalized = strtolower(trim((string)$value));
+    if ($normalized === 'inhand' || $normalized === 'courier' || $normalized === 'parcelservice') {
+        return $normalized;
+    }
+    // Backward-compatibility mapping
+    if ($normalized === 'pickup' || $normalized === 'in_hand') {
+        return 'inhand';
+    }
+    if ($normalized === 'delivery' || $normalized === 'parcel_service') {
+        return 'parcelservice';
+    }
+    return 'inhand';
+}
+
+function isValidDeliveryType($value) {
+    return in_array((string)$value, ['inhand', 'courier', 'parcelservice'], true);
+}
+
+function normalizeDeliveryTypeRowsInDatabase($conn) {
+    try {
+        $conn->exec("
+            UPDATE deliveries
+            SET delivery_type = 'inhand'
+            WHERE delivery_type IS NULL
+               OR delivery_type = ''
+               OR delivery_type = 'in_hand'
+               OR delivery_type = 'pickup'
+        ");
+
+        $conn->exec("
+            UPDATE deliveries
+            SET delivery_type = 'parcelservice'
+            WHERE delivery_type = 'parcel_service'
+               OR delivery_type = 'delivery'
+               OR delivery_type = 'home_delivery'
+        ");
+    } catch (Exception $e) {
+        // Do not block API if cleanup fails; requests can still proceed.
+        error_log('Delivery type normalization failed: ' . $e->getMessage());
+    }
+}
+
+function hasDeliveredProductStatus($statusMapRaw) {
+    if ($statusMapRaw === null || $statusMapRaw === '') {
+        return false;
+    }
+
+    $statusMap = $statusMapRaw;
+    if (is_string($statusMapRaw)) {
+        $decoded = json_decode($statusMapRaw, true);
+        if (!is_array($decoded)) {
+            return false;
+        }
+        $statusMap = $decoded;
+    }
+
+    if (!is_array($statusMap)) {
+        return false;
+    }
+
+    foreach ($statusMap as $status) {
+        if (normalizeFlowStatus($status) === 'deliveryed') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function serviceOrdersHasProductStatusMapColumn($conn) {
+    static $hasColumn = null;
+    if ($hasColumn !== null) {
+        return $hasColumn;
+    }
+
+    try {
+        $stmt = $conn->prepare("
+            SELECT 1
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'service_orders'
+              AND COLUMN_NAME = 'product_status_map'
+            LIMIT 1
+        ");
+        $stmt->execute();
+        $hasColumn = (bool)$stmt->fetchColumn();
+    } catch (Exception $e) {
+        $hasColumn = false;
+    }
+
+    return $hasColumn;
+}
+
+function serviceOrdersHasColumn($conn, $columnName) {
+    static $cache = [];
+    $key = strtolower((string)$columnName);
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
+    try {
+        $stmt = $conn->prepare("
+            SELECT 1
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'service_orders'
+              AND COLUMN_NAME = :column_name
+            LIMIT 1
+        ");
+        $stmt->bindValue(':column_name', $columnName, PDO::PARAM_STR);
+        $stmt->execute();
+        $cache[$key] = (bool)$stmt->fetchColumn();
+    } catch (Exception $e) {
+        $cache[$key] = false;
+    }
+    return $cache[$key];
+}
+
+function syncDeliveredProductStatusToDeliveries($conn) {
+    $hasProductStatusMapColumn = serviceOrdersHasProductStatusMapColumn($conn);
+    $productStatusMapSelect = $hasProductStatusMapColumn ? "so.product_status_map" : "NULL AS product_status_map";
+
+    $ordersQuery = "SELECT so.id, so.order_code, so.client_id, " . $productStatusMapSelect . ", so.created_at,
+                           c.full_name AS client_name, c.phone AS client_phone, c.address AS client_address,
+                           p.product_name
+                    FROM service_orders so
+                    LEFT JOIN clients c ON c.id = so.client_id
+                    LEFT JOIN products p ON p.id = so.product_id";
+    $ordersStmt = $conn->prepare($ordersQuery);
+    $ordersStmt->execute();
+    $orders = $ordersStmt->fetchAll(PDO::FETCH_ASSOC);
+
+    $checkDeliveryStmt = $conn->prepare("SELECT id, status, delivered_date FROM deliveries WHERE order_id = :order_id ORDER BY id DESC LIMIT 1");
+    $insertDeliveryStmt = $conn->prepare(
+        "INSERT INTO deliveries (
+            order_id, delivery_code, delivery_type, address, contact_person, contact_phone,
+            scheduled_date, scheduled_time, delivered_date, delivery_person, status, notes, created_at, updated_at
+        ) VALUES (
+            :order_id, :delivery_code, :delivery_type, :address, :contact_person, :contact_phone,
+            :scheduled_date, :scheduled_time, :delivered_date, :delivery_person, :status, :notes, NOW(), NOW()
+        )"
+    );
+    $updateDeliveryStmt = $conn->prepare(
+        "UPDATE deliveries
+         SET status = 'delivered',
+             delivered_date = COALESCE(delivered_date, NOW()),
+             updated_at = NOW()
+         WHERE id = :id"
+    );
+
+    foreach ($orders as $order) {
+        if (!hasDeliveredProductStatus($order['product_status_map'] ?? null)) {
+            continue;
+        }
+
+        $orderId = (int)$order['id'];
+        if ($orderId <= 0) {
+            continue;
+        }
+
+        $checkDeliveryStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
+        $checkDeliveryStmt->execute();
+        $existingDelivery = $checkDeliveryStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($existingDelivery) {
+            $normalizedExisting = normalizeFlowStatus($existingDelivery['status'] ?? '');
+            if ($normalizedExisting !== 'deliveryed') {
+                $updateDeliveryStmt->bindValue(':id', (int)$existingDelivery['id'], PDO::PARAM_INT);
+                $updateDeliveryStmt->execute();
+            }
+            continue;
+        }
+
+        $deliveryCode = 'DEL' . str_pad((string)$orderId, 6, '0', STR_PAD_LEFT);
+        $scheduledDate = null;
+        if (!empty($order['created_at'])) {
+            $scheduledDate = date('Y-m-d', strtotime($order['created_at']));
+        }
+
+        $insertDeliveryStmt->bindValue(':order_id', $orderId, PDO::PARAM_INT);
+        $insertDeliveryStmt->bindValue(':delivery_code', $deliveryCode);
+        $insertDeliveryStmt->bindValue(':delivery_type', 'inhand');
+        $insertDeliveryStmt->bindValue(':address', $order['client_address'] ?: 'Address not specified');
+        $insertDeliveryStmt->bindValue(':contact_person', $order['client_name'] ?: 'Customer');
+        $insertDeliveryStmt->bindValue(':contact_phone', $order['client_phone'] ?: 'N/A');
+        $insertDeliveryStmt->bindValue(':scheduled_date', $scheduledDate, $scheduledDate ? PDO::PARAM_STR : PDO::PARAM_NULL);
+        $insertDeliveryStmt->bindValue(':scheduled_time', '09:00:00');
+        $insertDeliveryStmt->bindValue(':delivered_date', date('Y-m-d H:i:s'));
+        $insertDeliveryStmt->bindValue(':delivery_person', 'System Auto-assigned');
+        $insertDeliveryStmt->bindValue(':status', 'delivered');
+        $insertDeliveryStmt->bindValue(
+            ':notes',
+            'Auto-created from product_status_map deliveryed for order ' . ($order['order_code'] ?: ('#' . $orderId))
+                . ' - Product: ' . ($order['product_name'] ?: 'Unknown')
+        );
+        $insertDeliveryStmt->execute();
+    }
+}
+
+function deliveredDeliveryWhereClause($alias = 'd') {
+    return "(
+        LOWER(TRIM(COALESCE({$alias}.status, ''))) IN ('delivered', 'deliveryed')
+        OR (
+            {$alias}.delivered_date IS NOT NULL
+            AND {$alias}.delivered_date <> ''
+            AND {$alias}.delivered_date <> '0000-00-00 00:00:00'
+        )
+    )";
+}
+
 /**
  * Get all deliveries
  */
 function getDeliveries($conn) {
     try {
-        // Check if fetching single delivery by ID
+        $parseNameList = function ($value): array {
+            if (is_array($value)) {
+                return array_values(array_filter(array_map(function ($entry) {
+                    return trim((string)$entry);
+                }, $value), function ($entry) {
+                    return $entry !== '';
+                }));
+            }
+            if (!is_string($value)) return [];
+            $trimmed = trim($value);
+            if ($trimmed === '') return [];
+            $decoded = json_decode($trimmed, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return array_values(array_filter(array_map(function ($entry) {
+                    return trim((string)$entry);
+                }, $decoded), function ($entry) {
+                    return $entry !== '';
+                }));
+            }
+            $parts = preg_split('/\|\||,/', $trimmed);
+            return array_values(array_filter(array_map(function ($entry) {
+                return trim((string)$entry);
+            }, $parts ?: []), function ($entry) {
+                return $entry !== '';
+            }));
+        };
+
+        $hasProductNamesColumn = serviceOrdersHasColumn($conn, 'product_names');
+        $hasProductSerialNumbersColumn = serviceOrdersHasColumn($conn, 'product_serial_numbers');
+        $productNamesSelect = $hasProductNamesColumn ? "so.product_names" : "NULL AS product_names";
+        $productSerialsSelect = $hasProductSerialNumbersColumn ? "so.product_serial_numbers" : "NULL AS product_serial_numbers";
+
         if (isset($_GET['id']) && !empty($_GET['id'])) {
-            $query = "SELECT d.*, 
+            $query = "SELECT d.*,
+                             COALESCE(NULLIF(d.delivery_type, ''), 'inhand') AS delivery_type,
                              o.order_code, 
+                             so.product_ids,
+                             {$productNamesSelect},
+                             {$productSerialsSelect},
+                             so.product_status_map,
+                             so.handover_type_map,
                              c.full_name as client_name, 
                              c.phone as client_phone,
                              c.email as client_email,
-                             c.address as client_address
+                             c.address as client_address,
+                             p.product_name,
+                             p.brand AS product_brand,
+                             p.model AS product_model,
+                             p.serial_number AS product_serial_number
                       FROM deliveries d 
                       LEFT JOIN service_orders o ON d.order_id = o.id 
+                      LEFT JOIN service_orders so ON d.order_id = so.id
                       LEFT JOIN clients c ON o.client_id = c.id
+                      LEFT JOIN products p ON p.id = COALESCE(d.product_id, so.product_id)
                       WHERE d.id = :id";
-            
+
             $stmt = $conn->prepare($query);
-            $stmt->bindParam(':id', $_GET['id'], PDO::PARAM_INT);
+            $stmt->bindValue(':id', (int)$_GET['id'], PDO::PARAM_INT);
             $stmt->execute();
-            
             $delivery = $stmt->fetch(PDO::FETCH_ASSOC);
-            
+
             if ($delivery) {
+                $delivery['delivery_type'] = normalizeDeliveryType($delivery['delivery_type'] ?? '');
+                if (empty($delivery['product_serial_number']) && !empty($delivery['product_name'])) {
+                    $names = $parseNameList($delivery['product_names'] ?? null);
+                    $serials = $parseNameList($delivery['product_serial_numbers'] ?? null);
+                    $target = strtolower(trim((string)$delivery['product_name']));
+                    if (!empty($names) && !empty($serials)) {
+                        $found = false;
+                        foreach ($names as $index => $name) {
+                            if (strtolower(trim((string)$name)) === $target) {
+                                $delivery['product_serial_number'] = $serials[$index] ?? '';
+                                $found = true;
+                                break;
+                            }
+                        }
+                        if (!$found) {
+                            foreach ($names as $index => $name) {
+                                $normalizedName = strtolower(trim((string)$name));
+                                if ($normalizedName !== '' && (strpos($normalizedName, $target) !== false || strpos($target, $normalizedName) !== false)) {
+                                    $delivery['product_serial_number'] = $serials[$index] ?? '';
+                                    $found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!$found && !empty($serials[0])) {
+                            $delivery['product_serial_number'] = $serials[0];
+                        }
+                    }
+                }
                 echo json_encode([
                     'success' => true,
                     'delivery' => $delivery
@@ -138,120 +435,131 @@ function getDeliveries($conn) {
                     'message' => 'Delivery not found'
                 ]);
             }
-        } else {
-            // Get all deliveries with optional filters
-            $whereClause = '';
-            $params = [];
-            
-            // Filter by status if provided
-            if (isset($_GET['status']) && !empty($_GET['status'])) {
-                $whereClause = " WHERE d.status = :status";
-                $params[':status'] = $_GET['status'];
+            return;
+        }
+
+        $whereClause = " WHERE 1=1";
+        $params = [];
+
+        if (isset($_GET['status']) && $_GET['status'] !== '') {
+            $requestedStatus = strtolower(trim((string)$_GET['status']));
+            if ($requestedStatus === 'delivered' || $requestedStatus === 'deliveryed') {
+                $whereClause .= " AND " . deliveredDeliveryWhereClause('d');
+            } else {
+                $whereClause .= " AND LOWER(TRIM(COALESCE(d.status, ''))) = :status";
+                $params[':status'] = $requestedStatus;
             }
-            
-            // Filter by delivery person if provided
-            if (isset($_GET['delivery_person']) && !empty($_GET['delivery_person'])) {
-                $whereClause .= $whereClause ? " AND d.delivery_person = :delivery_person" : " WHERE d.delivery_person = :delivery_person";
-                $params[':delivery_person'] = $_GET['delivery_person'];
+        }
+        if (isset($_GET['delivery_person']) && $_GET['delivery_person'] !== '') {
+            $whereClause .= " AND d.delivery_person = :delivery_person";
+            $params[':delivery_person'] = $_GET['delivery_person'];
+        }
+        if (isset($_GET['start_date']) && $_GET['start_date'] !== '') {
+            $whereClause .= " AND d.scheduled_date >= :start_date";
+            $params[':start_date'] = $_GET['start_date'];
+        }
+        if (isset($_GET['end_date']) && $_GET['end_date'] !== '') {
+            $whereClause .= " AND d.scheduled_date <= :end_date";
+            $params[':end_date'] = $_GET['end_date'];
+        }
+        if (isset($_GET['delivery_code']) && $_GET['delivery_code'] !== '') {
+            $whereClause .= " AND d.delivery_code LIKE :delivery_code";
+            $params[':delivery_code'] = '%' . $_GET['delivery_code'] . '%';
+        }
+        if (isset($_GET['order_code']) && $_GET['order_code'] !== '') {
+            $whereClause .= " AND o.order_code LIKE :order_code";
+            $params[':order_code'] = '%' . $_GET['order_code'] . '%';
+        }
+        if (isset($_GET['client_name']) && $_GET['client_name'] !== '') {
+            $whereClause .= " AND c.full_name LIKE :client_name";
+            $params[':client_name'] = '%' . $_GET['client_name'] . '%';
+        }
+
+        $query = "SELECT d.*,
+                         COALESCE(NULLIF(d.delivery_type, ''), 'inhand') AS delivery_type,
+                         o.order_code, 
+                         so.product_ids,
+                         {$productNamesSelect},
+                         {$productSerialsSelect},
+                         so.product_status_map,
+                         so.handover_type_map,
+                         c.full_name as client_name, 
+                         c.phone as client_phone,
+                         c.email as client_email,
+                         c.address as client_address,
+                         p.product_name,
+                         p.brand AS product_brand,
+                         p.model AS product_model,
+                         p.serial_number AS product_serial_number
+                  FROM deliveries d 
+                  LEFT JOIN service_orders o ON d.order_id = o.id 
+                  LEFT JOIN service_orders so ON d.order_id = so.id
+                  LEFT JOIN clients c ON o.client_id = c.id
+                  LEFT JOIN products p ON p.id = COALESCE(d.product_id, so.product_id)
+                  {$whereClause}
+                  ORDER BY d.scheduled_date DESC, d.scheduled_time DESC";
+
+        $stmt = $conn->prepare($query);
+        foreach ($params as $key => $value) {
+            $stmt->bindValue($key, $value);
+        }
+        $stmt->execute();
+        $deliveries = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($deliveries as &$delivery) {
+            $delivery['delivery_type'] = normalizeDeliveryType($delivery['delivery_type'] ?? '');
+            if (!empty($delivery['scheduled_date'])) {
+                $delivery['scheduled_date_formatted'] = date('d/m/Y', strtotime($delivery['scheduled_date']));
             }
-            
-            // Filter by date range if provided
-            if (isset($_GET['start_date']) && !empty($_GET['start_date'])) {
-                $whereClause .= $whereClause ? " AND d.scheduled_date >= :start_date" : " WHERE d.scheduled_date >= :start_date";
-                $params[':start_date'] = $_GET['start_date'];
+            if (!empty($delivery['delivered_date'])) {
+                $delivery['delivered_date_formatted'] = date('d/m/Y H:i', strtotime($delivery['delivered_date']));
             }
-            
-            if (isset($_GET['end_date']) && !empty($_GET['end_date'])) {
-                $whereClause .= $whereClause ? " AND d.scheduled_date <= :end_date" : " WHERE d.scheduled_date <= :end_date";
-                $params[':end_date'] = $_GET['end_date'];
+            if (!empty($delivery['created_at'])) {
+                $delivery['created_at_formatted'] = date('d/m/Y H:i', strtotime($delivery['created_at']));
             }
-            
-            // Filter by delivery code
-            if (isset($_GET['delivery_code']) && !empty($_GET['delivery_code'])) {
-                $whereClause .= $whereClause ? " AND d.delivery_code LIKE :delivery_code" : " WHERE d.delivery_code LIKE :delivery_code";
-                $params[':delivery_code'] = '%' . $_GET['delivery_code'] . '%';
+            if (!empty($delivery['updated_at'])) {
+                $delivery['updated_at_formatted'] = date('d/m/Y H:i', strtotime($delivery['updated_at']));
             }
-            
-            // Filter by order code
-            if (isset($_GET['order_code']) && !empty($_GET['order_code'])) {
-                $whereClause .= $whereClause ? " AND o.order_code LIKE :order_code" : " WHERE o.order_code LIKE :order_code";
-                $params[':order_code'] = '%' . $_GET['order_code'] . '%';
+            if (!empty($delivery['scheduled_time'])) {
+                $delivery['scheduled_time_formatted'] = date('h:i A', strtotime($delivery['scheduled_time']));
             }
-            
-            // Filter by client name
-            if (isset($_GET['client_name']) && !empty($_GET['client_name'])) {
-                $whereClause .= $whereClause ? " AND c.full_name LIKE :client_name" : " WHERE c.full_name LIKE :client_name";
-                $params[':client_name'] = '%' . $_GET['client_name'] . '%';
-            }
-            
-            $query = "SELECT d.*, 
-                             o.order_code, 
-                             c.full_name as client_name, 
-                             c.phone as client_phone,
-                             c.email as client_email,
-                             c.address as client_address
-                      FROM deliveries d 
-                      LEFT JOIN service_orders o ON d.order_id = o.id 
-                      LEFT JOIN clients c ON o.client_id = c.id
-                      {$whereClause}
-                      ORDER BY d.scheduled_date DESC, d.scheduled_time DESC";
-            
-            $stmt = $conn->prepare($query);
-            
-            // Bind parameters if any
-            foreach ($params as $key => $value) {
-                $stmt->bindValue($key, $value);
-            }
-            
-            $stmt->execute();
-            
-            $deliveries = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            // Format dates for better readability
-            foreach ($deliveries as &$delivery) {
-                if (isset($delivery['scheduled_date'])) {
-                    $delivery['scheduled_date_formatted'] = date('d/m/Y', strtotime($delivery['scheduled_date']));
-                }
-                if (isset($delivery['delivered_date'])) {
-                    $delivery['delivered_date_formatted'] = date('d/m/Y H:i', strtotime($delivery['delivered_date']));
-                }
-                if (isset($delivery['created_at'])) {
-                    $delivery['created_at_formatted'] = date('d/m/Y H:i', strtotime($delivery['created_at']));
-                }
-                if (isset($delivery['updated_at'])) {
-                    $delivery['updated_at_formatted'] = date('d/m/Y H:i', strtotime($delivery['updated_at']));
-                }
-                
-                // Format scheduled time
-                if (isset($delivery['scheduled_time'])) {
-                    $delivery['scheduled_time_formatted'] = date('h:i A', strtotime($delivery['scheduled_time']));
-                }
-                
-                // Get product information if needed
-                if (isset($delivery['order_id'])) {
-                    $productQuery = "SELECT p.product_name, p.brand, p.model 
-                                     FROM service_orders so 
-                                     LEFT JOIN products p ON so.product_id = p.id 
-                                     WHERE so.id = :order_id";
-                    $productStmt = $conn->prepare($productQuery);
-                    $productStmt->bindParam(':order_id', $delivery['order_id'], PDO::PARAM_INT);
-                    $productStmt->execute();
-                    $productInfo = $productStmt->fetch(PDO::FETCH_ASSOC);
-                    
-                    if ($productInfo) {
-                        $delivery['product_name'] = $productInfo['product_name'];
-                        $delivery['product_brand'] = $productInfo['brand'];
-                        $delivery['product_model'] = $productInfo['model'];
+
+            if (empty($delivery['product_serial_number']) && !empty($delivery['product_name'])) {
+                $names = $parseNameList($delivery['product_names'] ?? null);
+                $serials = $parseNameList($delivery['product_serial_numbers'] ?? null);
+                $target = strtolower(trim((string)$delivery['product_name']));
+                if (!empty($names) && !empty($serials)) {
+                    $found = false;
+                    foreach ($names as $index => $name) {
+                        if (strtolower(trim((string)$name)) === $target) {
+                            $delivery['product_serial_number'] = $serials[$index] ?? '';
+                            $found = true;
+                            break;
+                        }
+                    }
+                    if (!$found) {
+                        foreach ($names as $index => $name) {
+                            $normalizedName = strtolower(trim((string)$name));
+                            if ($normalizedName !== '' && (strpos($normalizedName, $target) !== false || strpos($target, $normalizedName) !== false)) {
+                                $delivery['product_serial_number'] = $serials[$index] ?? '';
+                                $found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!$found && !empty($serials[0])) {
+                        $delivery['product_serial_number'] = $serials[0];
                     }
                 }
             }
-            
-            echo json_encode([
-                'success' => true,
-                'count' => count($deliveries),
-                'deliveries' => $deliveries
-            ]);
         }
+        unset($delivery);
+
+        echo json_encode([
+            'success' => true,
+            'count' => count($deliveries),
+            'deliveries' => $deliveries
+        ]);
     } catch (PDOException $e) {
         http_response_code(500);
         echo json_encode([
@@ -261,7 +569,6 @@ function getDeliveries($conn) {
         ]);
     }
 }
-
 /**
  * Create a new delivery
  */
@@ -270,7 +577,8 @@ function createDelivery($conn) {
         $data = json_decode(file_get_contents("php://input"), true);
         
         // If no JSON data, check form data
-        if (empty($data) && $_SERVER['CONTENT_TYPE'] === 'application/x-www-form-urlencoded') {
+        $contentType = isset($_SERVER['CONTENT_TYPE']) ? strtolower((string)$_SERVER['CONTENT_TYPE']) : '';
+        if (empty($data) && strpos($contentType, 'application/x-www-form-urlencoded') !== false) {
             $data = $_POST;
         }
         
@@ -332,7 +640,16 @@ function createDelivery($conn) {
         
         $stmt->bindParam(':order_id', $data['order_id'], PDO::PARAM_INT);
         $stmt->bindParam(':delivery_code', $delivery_code);
-        $stmt->bindParam(':delivery_type', $data['delivery_type']);
+        $deliveryType = normalizeDeliveryType($data['delivery_type']);
+        if (!isValidDeliveryType($deliveryType)) {
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'message' => 'Invalid delivery_type. Allowed: inhand, courier, parcelservice'
+            ]);
+            return;
+        }
+        $stmt->bindParam(':delivery_type', $deliveryType);
         $stmt->bindParam(':address', $data['address']);
         $stmt->bindParam(':contact_person', $data['contact_person']);
         $stmt->bindParam(':contact_phone', $data['contact_phone']);
@@ -358,6 +675,9 @@ function createDelivery($conn) {
             $fetchStmt->bindParam(':id', $delivery_id, PDO::PARAM_INT);
             $fetchStmt->execute();
             $delivery = $fetchStmt->fetch(PDO::FETCH_ASSOC);
+            if ($delivery) {
+                $delivery['delivery_type'] = normalizeDeliveryType($delivery['delivery_type'] ?? '');
+            }
             
             http_response_code(201);
             echo json_encode([
@@ -391,30 +711,34 @@ function createDelivery($conn) {
  */
 function updateDelivery($conn) {
     try {
-        // Get delivery ID from URL parameter or request body
-        $id = isset($_GET['id']) ? $_GET['id'] : null;
-        
-        if (!$id) {
-            $data = json_decode(file_get_contents("php://input"), true);
-            $id = isset($data['id']) ? $data['id'] : null;
+        $rawInput = file_get_contents("php://input");
+        $data = json_decode($rawInput, true);
+        if (!is_array($data)) {
+            $data = [];
         }
-        
-        if (!$id) {
+
+        // Get delivery ID from URL parameter first, then request body
+        $id = isset($_GET['id']) ? $_GET['id'] : null;
+        if (!$id && isset($data['id'])) {
+            $id = $data['id'];
+        }
+
+        if (!$id || !is_numeric($id)) {
             http_response_code(400);
             echo json_encode(['success' => false, 'message' => 'Delivery ID is required']);
             return;
         }
-        
-        $data = json_decode(file_get_contents("php://input"), true);
-        
+
         // If no JSON data, check form data
-        if (empty($data) && $_SERVER['CONTENT_TYPE'] === 'application/x-www-form-urlencoded') {
+        $contentType = isset($_SERVER['CONTENT_TYPE']) ? strtolower((string)$_SERVER['CONTENT_TYPE']) : '';
+        if (empty($data) && strpos($contentType, 'application/x-www-form-urlencoded') !== false) {
             $data = $_POST;
         }
         
         // Check if delivery exists
         $checkQuery = "SELECT id, status FROM deliveries WHERE id = :id";
         $checkStmt = $conn->prepare($checkQuery);
+        $id = (int)$id;
         $checkStmt->bindParam(':id', $id, PDO::PARAM_INT);
         $checkStmt->execute();
         
@@ -445,6 +769,17 @@ function updateDelivery($conn) {
         
         foreach ($allowed_fields as $field) {
             if (isset($data[$field])) {
+                if ($field === 'delivery_type') {
+                    $data[$field] = normalizeDeliveryType($data[$field]);
+                    if (!isValidDeliveryType($data[$field])) {
+                        http_response_code(400);
+                        echo json_encode([
+                            'success' => false,
+                            'message' => 'Invalid delivery_type. Allowed: inhand, courier, parcelservice'
+                        ]);
+                        return;
+                    }
+                }
                 $fields[] = "{$field} = :{$field}";
                 $params[":{$field}"] = $data[$field];
             }
@@ -478,6 +813,9 @@ function updateDelivery($conn) {
             $fetchStmt->bindParam(':id', $id, PDO::PARAM_INT);
             $fetchStmt->execute();
             $delivery = $fetchStmt->fetch(PDO::FETCH_ASSOC);
+            if ($delivery) {
+                $delivery['delivery_type'] = normalizeDeliveryType($delivery['delivery_type'] ?? '');
+            }
             
             echo json_encode([
                 'success' => true,

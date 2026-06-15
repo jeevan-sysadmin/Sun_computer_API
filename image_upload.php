@@ -1,5 +1,5 @@
 <?php
-// C:\xampp\htdocs\sun_computers\api\image_upload.php
+// C:\xampp\htdocs\raj_communication\api\image_upload.php
 
 // Enable CORS
 header("Access-Control-Allow-Origin: *");
@@ -18,8 +18,8 @@ error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
 // Include required files
-require_once __DIR__ . '/config/database.php';
-require_once __DIR__ . '/helpers/jwt_helper.php';
+require_once __DIR__ . '/api/config/database.php';
+require_once __DIR__ . '/api/helpers/jwt_helper.php';
 
 class ImageUpload {
     private $conn;
@@ -197,7 +197,7 @@ class ImageUpload {
     private function getImageUrl($filename) {
         $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'];
-        $base_url = $protocol . '://' . $host . '/sun_computers/uploads/profile_images/';
+        $base_url = $protocol . '://' . $host . '/raj_communication/uploads/profile_images/';
         return $base_url . $filename;
     }
     

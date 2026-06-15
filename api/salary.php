@@ -44,7 +44,7 @@ function salary_record_by_id(PDO $db, int $id): ?array {
 }
 
 $db = finance_connection();
-$user = finance_user(true);
+$user = finance_user(false);
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {

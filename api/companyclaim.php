@@ -11,7 +11,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
 
 require_once __DIR__ . '/config/database.php';
 
@@ -21,6 +22,22 @@ function formatNullableDate($value, $format = 'd/m/Y') {
     }
 
     return date($format, strtotime($value));
+}
+
+function buildDateRange(?string $startDate, ?string $endDate): array {
+    $range = [];
+
+    if (!empty($startDate)) {
+        $range['start'] = $startDate . ' 00:00:00';
+    }
+
+    if (!empty($endDate)) {
+        $end = new DateTime($endDate . ' 00:00:00');
+        $end->modify('+1 day');
+        $range['end'] = $end->format('Y-m-d H:i:s');
+    }
+
+    return $range;
 }
 
 try {
@@ -74,13 +91,15 @@ try {
     }
 
     if (!empty($_GET['start_date'])) {
-        $query .= " AND DATE(created_at) >= :start_date";
-        $params[':start_date'] = $_GET['start_date'];
+        $dateRange = buildDateRange($_GET['start_date'], null);
+        $query .= " AND created_at >= :start_date";
+        $params[':start_date'] = $dateRange['start'];
     }
 
     if (!empty($_GET['end_date'])) {
-        $query .= " AND DATE(created_at) <= :end_date";
-        $params[':end_date'] = $_GET['end_date'];
+        $dateRange = buildDateRange(null, $_GET['end_date']);
+        $query .= " AND created_at < :end_date";
+        $params[':end_date'] = $dateRange['end'];
     }
 
     $query .= " ORDER BY created_at DESC";
